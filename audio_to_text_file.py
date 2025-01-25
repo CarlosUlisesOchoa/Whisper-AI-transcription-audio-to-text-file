@@ -6,7 +6,7 @@ import re  # Add this import at the top
 
 # How to use:
 # Example:
-# py .\audio_to_text_file.py "D:\Shane\Download\wolverin\1-pending\myFilename" --language "es"
+# py .\audio_to_text_file.py "D:\files\audio_folder" --language "es"
 
 def sanitize_filename(filename):
     # Remove file extension
