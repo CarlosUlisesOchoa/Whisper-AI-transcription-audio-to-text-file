@@ -75,3 +75,11 @@ Output files will be saved in the same folder as the input files, with sanitized
 ## 🔑 License
 
 - [GPL-3.0 license](https://github.com/CarlosUlisesOchoa/Whisper-AI-transcription-audio-to-text-file/blob/main/LICENSE)
+
+## About developer
+
+Visit my web [Carlos Ochoa](https://carlos8a.com)
+
+---
+
+**Note:** If you encounter any issues with the project, please report them [here](https://github.com/CarlosUlisesOchoa/Whisper-AI-transcription-audio-to-text-file/issues). Contributions are welcome!
