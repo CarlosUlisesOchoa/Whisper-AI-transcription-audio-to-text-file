@@ -95,7 +95,7 @@ def main():
         device = "cpu"
         print("CUDA is not available. Using CPU.")
 
-    model = whisper.load_model("turbo", device=device)
+    model = whisper.load_model("medium", device=device)
 
     processed_files = []
     failed_files = []
