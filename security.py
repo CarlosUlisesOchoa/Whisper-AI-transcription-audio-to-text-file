@@ -1,0 +1,40 @@
+import os
+
+from fastapi import Request
+from fastapi.responses import JSONResponse
+from starlette.middleware.base import BaseHTTPMiddleware
+
+# Paths that skip authentication (useful for monitoring)
+PUBLIC_PATHS = {"/health"}
+
+
+class SecurityMiddleware(BaseHTTPMiddleware):
+    """Middleware that enforces IP whitelist and API key authentication."""
+
+    async def dispatch(self, request: Request, call_next):
+        # Skip auth for public endpoints
+        if request.url.path in PUBLIC_PATHS:
+            return await call_next(request)
+
+        # --- IP Whitelist ---
+        allowed_ips = os.environ.get("ALLOWED_IPS", "").strip()
+        if allowed_ips:
+            allowed_set = {ip.strip() for ip in allowed_ips.split(",") if ip.strip()}
+            client_ip = request.client.host if request.client else None
+            if client_ip not in allowed_set:
+                return JSONResponse(
+                    status_code=403,
+                    content={"detail": f"IP {client_ip} is not allowed"},
+                )
+
+        # --- API Key ---
+        api_key = os.environ.get("API_KEY", "").strip()
+        if api_key:
+            request_key = request.headers.get("X-API-Key", "")
+            if request_key != api_key:
+                return JSONResponse(
+                    status_code=403,
+                    content={"detail": "Invalid or missing API key"},
+                )
+
+        return await call_next(request)
