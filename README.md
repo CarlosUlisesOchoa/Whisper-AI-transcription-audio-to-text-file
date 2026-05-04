@@ -72,7 +72,104 @@ The script will:
 
 Output files will be saved in the same folder as the input files, with sanitized filenames and .txt extension.
 
-## 🔑 License
+## � Docker / API Mode
+
+The project includes a **FastAPI HTTP server** that exposes Whisper as a remote transcription service. It is fully Dockerized with GPU support via the NVIDIA Container Toolkit.
+
+### Prerequisites
+
+- [Docker](https://docs.docker.com/get-docker/) with the [Docker Compose plugin](https://docs.docker.com/compose/install/)
+- [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html) (for GPU acceleration)
+
+### 1. Configure environment
+
+```bash
+cp .env.example .env
+```
+
+Edit `.env` and set your values:
+
+```env
+# Required: shared secret that callers must send in X-API-Key header
+API_KEY=change-me-to-a-random-secret
+
+# Optional: comma-separated IPs allowed to call the API (leave empty to allow all)
+ALLOWED_IPS=
+
+# Optional overrides (defaults shown)
+# JOB_TTL_SECONDS=3600
+# MAX_UPLOAD_SIZE_MB=500
+```
+
+> **Note:** `/health` is public and does not require the API key.
+
+### 2. Build and start
+
+```bash
+docker compose up --build -d
+```
+
+The container pre-loads the Whisper model on startup — allow ~60–120 seconds on first run.
+
+### 3. Verify it's running
+
+```bash
+curl http://localhost:8000/health
+```
+
+Example response:
+
+```json
+{
+  "status": "ok",
+  "device": "cuda",
+  "gpu_name": "NVIDIA GeForce RTX 3080",
+  "queue_depth": 0,
+  "jobs_total": 0
+}
+```
+
+### 4. Submit a transcription job
+
+```bash
+curl -X POST http://localhost:8000/transcribe \
+  -H "X-API-Key: your-api-key" \
+  -F "file=@recording.mp3" \
+  -F "language=en"
+```
+
+Supported formats: `.mp3`, `.wav`, `.m4a`, `.ogg`, `.flac`
+
+`language` is optional — omit it for automatic language detection.
+
+Response:
+
+```json
+{ "job_id": "3f8a1c2d-..." }
+```
+
+### 5. Poll for the result
+
+```bash
+curl http://localhost:8000/jobs/3f8a1c2d-... \
+  -H "X-API-Key: your-api-key"
+```
+
+Job status values: `queued` → `processing` → `completed` / `failed`
+
+Completed response includes the full timestamped transcription in `result.formatted` and the plain text in `result.text`. Completed and failed jobs are purged from memory after `JOB_TTL_SECONDS` (default: 1 hour).
+
+### 6. Stop the service
+
+```bash
+docker compose down
+```
+
+The Whisper model cache is stored in a Docker volume (`whisper-cache`) so it survives container restarts.
+
+---
+
+## �🔑 License
 
 - [GPL-3.0 license](https://github.com/CarlosUlisesOchoa/Whisper-AI-transcription-audio-to-text-file/blob/main/LICENSE)
 
