@@ -50,25 +50,30 @@ The project has two modes: **CLI** (batch transcription) and **API** (HTTP servi
 
 ## Running the API (Docker)
 
+The API is exposed **only through Tailscale** — no LAN or public binding. Two containers run: a Tailscale sidecar that joins your tailnet, and `whisper-api` that shares its network namespace.
+
 ```bash
 # 1. Configure environment
 cp .env.example .env
-# Edit .env: set API_KEY and ALLOWED_IPS
+# Edit .env: set TS_AUTHKEY (from https://login.tailscale.com/admin/settings/keys), API_KEY
 
 # 2. Build and start
 docker compose up --build -d
 
-# 3. Check health
-curl http://localhost:8000/health
+# 3. Confirm Tailscale node joined tailnet
+docker compose logs tailscale   # look for: "Success."
 
-# 4. Submit transcription
-curl -X POST http://localhost:8000/transcribe \
+# 4. Check health (from any Tailscale device)
+curl http://whisper-api:8000/health
+
+# 5. Submit transcription
+curl -X POST http://whisper-api:8000/transcribe \
   -H "X-API-Key: your-key" \
   -F "file=@recording.mp3" \
   -F "language=en"
 
-# 5. Poll for result
-curl http://localhost:8000/jobs/{job_id} \
+# 6. Poll for result
+curl http://whisper-api:8000/jobs/{job_id} \
   -H "X-API-Key: your-key"
 ```
 
