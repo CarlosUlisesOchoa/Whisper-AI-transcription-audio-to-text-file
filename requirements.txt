@@ -1,5 +1,5 @@
 torch>=2.0.0
-openai-whisper>=20250625
+openai-whisper==20240930
 ffmpeg-python>=0.2.0
 fastapi>=0.104.0
 uvicorn[standard]>=0.24.0
