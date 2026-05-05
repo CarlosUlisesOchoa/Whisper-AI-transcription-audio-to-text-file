@@ -72,16 +72,25 @@ The script will:
 
 Output files will be saved in the same folder as the input files, with sanitized filenames and .txt extension.
 
-## � Docker / API Mode
+## 🐳 Docker / API Mode
 
-The project includes a **FastAPI HTTP server** that exposes Whisper as a remote transcription service. It is fully Dockerized with GPU support via the NVIDIA Container Toolkit.
+The project includes a **FastAPI HTTP server** that exposes Whisper as a remote transcription service. It is fully Dockerized with GPU support and **exposed exclusively through [Tailscale](https://tailscale.com/)** — nothing binds to LAN or a public interface.
+
+Access model: only devices on your tailnet can reach the API at all. The `X-API-Key` header adds a second layer of defense.
 
 ### Prerequisites
 
 - [Docker](https://docs.docker.com/get-docker/) with the [Docker Compose plugin](https://docs.docker.com/compose/install/)
 - [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html) (for GPU acceleration)
+- A [Tailscale](https://tailscale.com/) account with MagicDNS enabled
 
-### 1. Configure environment
+### 1. Mint a Tailscale auth key
+
+Go to [https://login.tailscale.com/admin/settings/keys](https://login.tailscale.com/admin/settings/keys) and create a **reusable** auth key. Copy the `tskey-auth-…` value.
+
+> Use a reusable key (not ephemeral) so the node persists across container restarts.
+
+### 2. Configure environment
 
 ```bash
 cp .env.example .env
@@ -90,31 +99,41 @@ cp .env.example .env
 Edit `.env` and set your values:
 
 ```env
-# Required: shared secret that callers must send in X-API-Key header
+# Tailscale sidecar
+TS_AUTHKEY=tskey-auth-xxxxxxxxxxxx
+TS_HOSTNAME=whisper-api          # appears as this name in your tailnet
+
+# Required: callers must send this in X-API-Key header
 API_KEY=change-me-to-a-random-secret
 
-# Optional: comma-separated IPs allowed to call the API (leave empty to allow all)
+# DEPRECATED — tailnet ACLs replace IP whitelisting. Leave empty.
 ALLOWED_IPS=
-
-# Optional overrides (defaults shown)
-# JOB_TTL_SECONDS=3600
-# MAX_UPLOAD_SIZE_MB=500
 ```
 
 > **Note:** `/health` is public and does not require the API key.
 
-### 2. Build and start
+### 3. Build and start
 
 ```bash
 docker compose up --build -d
 ```
 
-The container pre-loads the Whisper model on startup — allow ~60–120 seconds on first run.
+Two containers start: `whisper-tailscale` (joins your tailnet) and `whisper-api` (shares its network namespace). Allow ~60–120 seconds on first run for the Whisper model to load.
 
-### 3. Verify it's running
+Confirm the node joined your tailnet:
 
 ```bash
-curl http://localhost:8000/health
+docker compose logs tailscale
+# look for: "Success."
+```
+
+### 4. Verify it's running
+
+From **any device on your tailnet** (not the host machine's LAN IP):
+
+```bash
+curl http://whisper-api:8000/health
+# or use the MagicDNS FQDN: http://whisper-api.<tailnet-name>.ts.net:8000/health
 ```
 
 Example response:
@@ -129,10 +148,12 @@ Example response:
 }
 ```
 
-### 4. Submit a transcription job
+> `"device": "cuda"` confirms GPU passthrough is working. If you see `"cpu"`, check your NVIDIA Container Toolkit / WSL2 GPU passthrough setup.
+
+### 5. Submit a transcription job
 
 ```bash
-curl -X POST http://localhost:8000/transcribe \
+curl -X POST http://whisper-api:8000/transcribe \
   -H "X-API-Key: your-api-key" \
   -F "file=@recording.mp3" \
   -F "language=en"
@@ -148,10 +169,10 @@ Response:
 { "job_id": "3f8a1c2d-..." }
 ```
 
-### 5. Poll for the result
+### 6. Poll for the result
 
 ```bash
-curl http://localhost:8000/jobs/3f8a1c2d-... \
+curl http://whisper-api:8000/jobs/3f8a1c2d-... \
   -H "X-API-Key: your-api-key"
 ```
 
@@ -159,13 +180,21 @@ Job status values: `queued` → `processing` → `completed` / `failed`
 
 Completed response includes the full timestamped transcription in `result.formatted` and the plain text in `result.text`. Completed and failed jobs are purged from memory after `JOB_TTL_SECONDS` (default: 1 hour).
 
-### 6. Stop the service
+### 7. Stop the service
 
 ```bash
 docker compose down
 ```
 
-The Whisper model cache is stored in a Docker volume (`whisper-cache`) so it survives container restarts.
+The Whisper model cache is stored in a Docker volume (`whisper-cache`) so it survives container restarts. Tailscale state is stored in `tailscale-state` so the node keeps its identity across restarts.
+
+### Tailscale ACL recommendation
+
+By default, all tailnet peers can reach each other. If you share your tailnet, add an ACL rule in the [Tailscale admin console](https://login.tailscale.com/admin/acls) to restrict which devices may reach `whisper-api` on port 8000.
+
+### Troubleshooting: kernel mode Tailscale on Windows Docker Desktop (WSL2)
+
+If `docker compose logs tailscale` shows `/dev/net/tun` errors, set `TS_USERSPACE=true` in `.env`. This uses userspace networking (slightly slower, but no kernel dependencies).
 
 ---
 
