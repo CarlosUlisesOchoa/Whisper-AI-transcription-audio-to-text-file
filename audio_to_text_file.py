@@ -6,6 +6,7 @@ from transcriber import (
     sanitize_filename,
     get_device,
     get_model,
+    transcribe_audio,
     format_transcription,
 )
 
@@ -85,7 +86,8 @@ def main():
     else:
         print("CUDA is not available. Using CPU.")
 
-    model = get_model()
+    # Preload model once so first file does not pay the full cold-start cost.
+    get_model()
 
     processed_files = []
     failed_files = []
@@ -98,7 +100,7 @@ def main():
             output_path = os.path.join(directory, sanitized_txt)
 
             print("Starting transcription...")
-            result = model.transcribe(audio_file, language=args.language)
+            result = transcribe_audio(audio_file, language=args.language)
 
             print("Transcription completed. Saving to:", output_path)
             formatted = format_transcription(os.path.basename(output_path), result["segments"])
