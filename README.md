@@ -106,6 +106,9 @@ TS_HOSTNAME=whisper-api          # appears as this name in your tailnet
 # Required: callers must send this in X-API-Key header
 API_KEY=change-me-to-a-random-secret
 
+# Optional for browser frontends (comma-separated). If omitted, API defaults to "*".
+# CORS_ALLOW_ORIGINS=http://localhost:5173,http://127.0.0.1:5173
+
 # DEPRECATED — tailnet ACLs replace IP whitelisting. Leave empty.
 ALLOWED_IPS=
 ```
