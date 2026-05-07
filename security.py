@@ -12,6 +12,10 @@ class SecurityMiddleware(BaseHTTPMiddleware):
     """Middleware that enforces IP whitelist and API key authentication."""
 
     async def dispatch(self, request: Request, call_next):
+        # CORS preflight requests do not include API auth headers.
+        if request.method == "OPTIONS":
+            return await call_next(request)
+
         # Skip auth for public endpoints
         if request.url.path in PUBLIC_PATHS:
             return await call_next(request)

@@ -9,6 +9,7 @@ from contextlib import asynccontextmanager
 
 import torch
 from fastapi import FastAPI, File, Form, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from security import SecurityMiddleware
@@ -36,6 +37,16 @@ gpu_lock = asyncio.Lock()
 executor = ThreadPoolExecutor(max_workers=1)
 
 
+def _get_allowed_origins() -> list[str]:
+    """Return allowed CORS origins from env (comma-separated)."""
+    raw_origins = os.environ.get("CORS_ALLOW_ORIGINS", "*").strip()
+    if not raw_origins:
+        return ["*"]
+
+    origins = [origin.strip() for origin in raw_origins.split(",") if origin.strip()]
+    return origins or ["*"]
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Pre-load the Whisper model on startup so the first request is fast."""
@@ -50,6 +61,13 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Whisper Transcription API", lifespan=lifespan)
 app.add_middleware(SecurityMiddleware)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_get_allowed_origins(),
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 def _cleanup_old_jobs():
