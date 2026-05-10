@@ -36,7 +36,7 @@ The project has two modes: **CLI** (batch transcription) and **API** (HTTP servi
 - **`transcriber.py`** — Shared core: model loading (singleton), transcription, filename sanitization. Used by both CLI and API.
 - **`audio_to_text_file.py`** — CLI entry point. Batch-transcribes audio files in a directory.
 - **`api.py`** — FastAPI HTTP server with async job queue. Endpoints: `/health`, `/transcribe`, `/jobs/{job_id}`.
-- **`security.py`** — FastAPI middleware enforcing IP whitelist (`ALLOWED_IPS` env var) and API key (`API_KEY` env var). `/health` is exempt.
+- **`security.py`** — FastAPI middleware enforcing API key (`API_KEY` env var). `/health` is exempt. IP whitelisting removed — WireGuard tunnel handles network-layer access control.
 
 ### Key behaviors
 
@@ -50,30 +50,35 @@ The project has two modes: **CLI** (batch transcription) and **API** (HTTP servi
 
 ## Running the API (Docker)
 
-The API is exposed **only through Tailscale** — no LAN or public binding. Two containers run: a Tailscale sidecar that joins your tailnet, and `whisper-api` that shares its network namespace.
+The API is exposed **only through a WireGuard tunnel** — no LAN or public binding. Two containers run: a WireGuard client sidecar that dials the VPS, and `whisper-api` that shares its network namespace. The VPS frontend reaches the API via the PC's WG IP (e.g. `http://10.0.0.5:8000`).
 
 ```bash
-# 1. Configure environment
-cp .env.example .env
-# Edit .env: set TS_AUTHKEY (from https://login.tailscale.com/admin/settings/keys), API_KEY
+# 1. Copy the example config and write your real wg0.conf
+cp wireguard/wg0.conf.example wireguard/wg0.conf
+# Edit wireguard/wg0.conf: fill in PrivateKey, Address, Peer PublicKey, Endpoint
 
-# 2. Build and start
+# 2. Configure environment
+cp .env.example .env
+# Edit .env: set API_KEY
+
+# 3. Build and start
 docker compose up --build -d
 
-# 3. Confirm Tailscale node joined tailnet
-docker compose logs tailscale   # look for: "Success."
+# 4. Confirm WireGuard tunnel is up
+docker compose logs wireguard   # look for: wg-quick: [#] wg setconf wg0 ...
+docker compose exec wireguard wg show  # expect latest handshake populated
 
-# 4. Check health (from any Tailscale device)
-curl http://whisper-api:8000/health
+# 5. Check health (from any WireGuard peer, e.g. the VPS)
+curl http://10.0.0.5:8000/health
 
-# 5. Submit transcription
-curl -X POST http://whisper-api:8000/transcribe \
+# 6. Submit transcription
+curl -X POST http://10.0.0.5:8000/transcribe \
   -H "X-API-Key: your-key" \
   -F "file=@recording.mp3" \
   -F "language=en"
 
-# 6. Poll for result
-curl http://whisper-api:8000/jobs/{job_id} \
+# 7. Poll for result
+curl http://10.0.0.5:8000/jobs/{job_id} \
   -H "X-API-Key: your-key"
 ```
 

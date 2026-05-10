@@ -74,21 +74,37 @@ Output files will be saved in the same folder as the input files, with sanitized
 
 ## 🐳 Docker / API Mode
 
-The project includes a **FastAPI HTTP server** that exposes Whisper as a remote transcription service. It is fully Dockerized with GPU support and **exposed exclusively through [Tailscale](https://tailscale.com/)** — nothing binds to LAN or a public interface.
+The project includes a **FastAPI HTTP server** that exposes Whisper as a remote transcription service. It is fully Dockerized with GPU support and **exposed exclusively through a [WireGuard](https://www.wireguard.com/) tunnel** — nothing binds to LAN or a public interface.
 
-Access model: only devices on your tailnet can reach the API at all. The `X-API-Key` header adds a second layer of defense.
+Access model: the PC runs a WireGuard **client** sidecar that dials a VPS WireGuard server. Only devices on that WG network (VPS, laptop, phone) can reach the API. The `X-API-Key` header adds a second layer of defense.
 
 ### Prerequisites
 
 - [Docker](https://docs.docker.com/get-docker/) with the [Docker Compose plugin](https://docs.docker.com/compose/install/)
 - [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html) (for GPU acceleration)
-- A [Tailscale](https://tailscale.com/) account with MagicDNS enabled
+- A WireGuard server (e.g. [wg-easy](https://github.com/wg-easy/wg-easy) on a VPS) with a client config for this machine
 
-### 1. Mint a Tailscale auth key
+### 1. Copy the example config and write your real wg0.conf
 
-Go to [https://login.tailscale.com/admin/settings/keys](https://login.tailscale.com/admin/settings/keys) and create a **reusable** auth key. Copy the `tskey-auth-…` value.
+```bash
+cp wireguard/wg0.conf.example wireguard/wg0.conf
+```
 
-> Use a reusable key (not ephemeral) so the node persists across container restarts.
+Edit `wireguard/wg0.conf` with the values issued by your VPS WG server:
+
+```ini
+[Interface]
+PrivateKey = <PC_PRIVATE_KEY>
+Address    = 10.0.0.5/32
+
+[Peer]
+PublicKey            = <VPS_PUBLIC_KEY>
+Endpoint             = vps.example.com:51820
+AllowedIPs           = 10.0.0.0/24
+PersistentKeepalive  = 25
+```
+
+> `wireguard/wg0.conf` is git-ignored — it contains your private key. Never commit it.
 
 ### 2. Configure environment
 
@@ -96,21 +112,10 @@ Go to [https://login.tailscale.com/admin/settings/keys](https://login.tailscale.
 cp .env.example .env
 ```
 
-Edit `.env` and set your values:
+Edit `.env` and set your API key:
 
 ```env
-# Tailscale sidecar
-TS_AUTHKEY=tskey-auth-xxxxxxxxxxxx
-TS_HOSTNAME=whisper-api          # appears as this name in your tailnet
-
-# Required: callers must send this in X-API-Key header
 API_KEY=change-me-to-a-random-secret
-
-# Optional for browser frontends (comma-separated). If omitted, API defaults to "*".
-# CORS_ALLOW_ORIGINS=http://localhost:5173,http://127.0.0.1:5173
-
-# DEPRECATED — tailnet ACLs replace IP whitelisting. Leave empty.
-ALLOWED_IPS=
 ```
 
 > **Note:** `/health` is public and does not require the API key.
@@ -121,22 +126,24 @@ ALLOWED_IPS=
 docker compose up --build -d
 ```
 
-Two containers start: `whisper-tailscale` (joins your tailnet) and `whisper-api` (shares its network namespace). Allow ~60–120 seconds on first run for the Whisper model to load.
+Two containers start: `whisper-wireguard` (dials the VPS over WireGuard) and `whisper-api` (shares its network namespace). Allow ~60–120 seconds on first run for the Whisper model to load.
 
-Confirm the node joined your tailnet:
+Confirm the tunnel is up:
 
 ```bash
-docker compose logs tailscale
-# look for: "Success."
+docker compose logs wireguard
+# look for: wg-quick: [#] wg setconf wg0 ...
+
+docker compose exec wireguard wg show
+# expect: latest handshake populated within ~30s
 ```
 
 ### 4. Verify it's running
 
-From **any device on your tailnet** (not the host machine's LAN IP):
+From **any device on the WG network** (e.g. the VPS):
 
 ```bash
-curl http://whisper-api:8000/health
-# or use the MagicDNS FQDN: http://whisper-api.<tailnet-name>.ts.net:8000/health
+curl http://10.0.0.5:8000/health
 ```
 
 Example response:
@@ -156,7 +163,7 @@ Example response:
 ### 5. Submit a transcription job
 
 ```bash
-curl -X POST http://whisper-api:8000/transcribe \
+curl -X POST http://10.0.0.5:8000/transcribe \
   -H "X-API-Key: your-api-key" \
   -F "file=@recording.mp3" \
   -F "language=en"
@@ -175,7 +182,7 @@ Response:
 ### 6. Poll for the result
 
 ```bash
-curl http://whisper-api:8000/jobs/3f8a1c2d-... \
+curl http://10.0.0.5:8000/jobs/3f8a1c2d-... \
   -H "X-API-Key: your-api-key"
 ```
 
@@ -189,15 +196,11 @@ Completed response includes the full timestamped transcription in `result.format
 docker compose down
 ```
 
-The Whisper model cache is stored in a Docker volume (`whisper-cache`) so it survives container restarts. Tailscale state is stored in `tailscale-state` so the node keeps its identity across restarts.
+The Whisper model cache is stored in a Docker volume (`whisper-cache`) so it survives container restarts.
 
-### Tailscale ACL recommendation
+### Troubleshooting: WireGuard kernel module on Windows Docker Desktop (WSL2)
 
-By default, all tailnet peers can reach each other. If you share your tailnet, add an ACL rule in the [Tailscale admin console](https://login.tailscale.com/admin/acls) to restrict which devices may reach `whisper-api` on port 8000.
-
-### Troubleshooting: kernel mode Tailscale on Windows Docker Desktop (WSL2)
-
-If `docker compose logs tailscale` shows `/dev/net/tun` errors, set `TS_USERSPACE=true` in `.env`. This uses userspace networking (slightly slower, but no kernel dependencies).
+If `docker compose logs wireguard` shows `Unable to find module 'wireguard'`, the WG kernel module is missing. Enable userspace mode by adding `- USE_BORINGTUN=true` to the `wireguard` service `environment:` in `docker-compose.yml`. Slight throughput hit, no other change.
 
 ---
 
