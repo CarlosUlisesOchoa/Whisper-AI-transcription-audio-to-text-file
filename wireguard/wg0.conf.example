@@ -1,0 +1,12 @@
+[Interface]
+# PC's WG client identity. Replace with values issued by VPS WG server.
+PrivateKey = <PC_PRIVATE_KEY>
+Address    = 10.0.0.5/32          # PC's IP inside the WG network
+DNS        = 1.1.1.1              # optional; remove if VPS handles DNS
+
+[Peer]
+# VPS WG server.
+PublicKey            = <VPS_PUBLIC_KEY>
+Endpoint             = vps.example.com:51820
+AllowedIPs           = 10.0.0.0/24    # routes ONLY WG subnet through tunnel
+PersistentKeepalive  = 25

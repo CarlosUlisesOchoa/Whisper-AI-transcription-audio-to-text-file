@@ -1,5 +1,10 @@
 ignore/
 
+# WireGuard client config contains private keys — never commit
+wireguard/*.conf
+wireguard/*.conf.*
+!wireguard/wg0.conf.example
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
