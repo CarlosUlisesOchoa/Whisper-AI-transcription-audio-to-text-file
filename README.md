@@ -1,16 +1,21 @@
 # Whisper Audio Transcription Tool 🎙️
 
-A powerful Python-based transcription tool that leverages OpenAI's Whisper model to transcribe audio files with GPU acceleration support.
+A Python transcription tool powered by [`faster-whisper`](https://github.com/SYSTRAN/faster-whisper) (CTranslate2 backend) — up to **4× faster** than `openai-whisper` on GPU, lower VRAM, and INT8 acceleration on CPU. Bundles its own audio decoding via PyAV, so **no system FFmpeg install is required**.
+
+Two run modes:
+
+- **CLI** — batch-transcribe a folder of audio files (`audio_to_text_file.py`).
+- **API** — FastAPI HTTP service with async job queue, exposed only over a WireGuard tunnel (`api.py`).
 
 ## 🌟 Features
 
-- Batch audio file transcription
-- GPU acceleration with CUDA support
-- Timestamp-based transcription output
-- Multi-language support
-- Easy-to-use command line interface
-- Automatic file status checking
-- Skip already transcribed files
+- Batch audio file transcription (CLI) and async HTTP API
+- GPU acceleration with CUDA 12 (float16) + automatic CPU fallback (int8)
+- Built-in Silero VAD filter — strips silence/noise to reduce hallucination loops
+- Automatic hallucination-loop detection with retry on higher-temperature settings
+- Timestamp-based transcription output with sanitized filenames
+- Multi-language support (auto-detect by default)
+- Skip already-transcribed files
 - Detailed processing summary
 
 ## 🔧 Usage Examples
@@ -36,10 +41,12 @@ Available arguments:
 
 ## 🔧 Requirements
 
-- Python 3.7+
-- FFmpeg
-- CUDA-compatible GPU (optional, for faster processing)
+- Python 3.8+
+- CUDA-compatible GPU (optional, for faster processing) with **CUDA 12** drivers
+- For GPU on host (non-Docker): **cuDNN 9** + **cuBLAS for CUDA 12** must be available to CTranslate2 (see Installation step 2)
 - Required Python packages (see `requirements.txt`)
+
+> No system FFmpeg install is required — `faster-whisper` ships PyAV which handles audio decoding.
 
 ## 🚀 Installation
 
@@ -54,6 +61,8 @@ git clone https://github.com/CarlosUlisesOchoa/Whisper-AI-transcription-audio-to
 ```bash
 pip install -r requirements.txt
 ```
+
+> **GPU users:** `requirements.txt` already pulls `nvidia-cublas-cu12` and `nvidia-cudnn-cu12==9.*` so CTranslate2 can find cuDNN 9 + cuBLAS at runtime. On Linux you may also need `LD_LIBRARY_PATH` pointing at the wheel install dirs (the Dockerfile does this automatically).
 
 3. Run the script:
 

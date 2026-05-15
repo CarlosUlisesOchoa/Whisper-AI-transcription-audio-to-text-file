@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-A single-script CLI tool that uses OpenAI's Whisper model to batch-transcribe audio files, with automatic GPU (CUDA) acceleration when available.
+A Python tool that uses `faster-whisper` (CTranslate2 backend) to transcribe audio files, with automatic GPU (CUDA) acceleration when available. Two modes: **CLI** for batch transcription of a folder, and **API** (FastAPI + async job queue) for remote transcription over a WireGuard tunnel.
 
 ## Running the Script
 
@@ -25,7 +25,6 @@ py audio_to_text_file.py "path/to/audio/folder" --accept
 pip install -r requirements.txt
 ```
 
-FFmpeg must also be installed and available on the system PATH (not a Python package).
 
 ## Architecture
 
@@ -42,7 +41,10 @@ The project has two modes: **CLI** (batch transcription) and **API** (HTTP servi
 
 - **Skip logic** (CLI): Before transcribing, checks if a `.txt` file with the sanitized name already exists. If so, the audio file is skipped.
 - **Filename sanitization** (`sanitize_filename` in `transcriber.py`): Converts to lowercase, replaces non-alphanumeric characters (except `-` and `_`) with dashes, collapses repeated dashes, strips leading/trailing dashes.
-- **Model**: Hardcoded to `whisper.load_model("medium")`. Device is auto-selected (CUDA if available, else CPU). Loaded once as a singleton.
+- **Model**: Uses `WhisperModel("medium", compute_type="float16"|"int8")` from `faster-whisper`. `compute_type` is `float16` on CUDA, `int8` on CPU. Device is auto-selected (CUDA if available, else CPU). Loaded once as a singleton. Requires CUDA 12 + cuDNN 9 for GPU inference (cuDNN 9 + cuBLAS are installed via `nvidia-cudnn-cu12==9.*` and `nvidia-cublas-cu12` pip wheels listed in `requirements.txt`). FFmpeg system install is **not required** — PyAV (bundled with faster-whisper) handles audio decoding.
+- **VAD filter**: `vad_filter=True` (Silero VAD) is on by default with `min_silence_duration_ms=500`. Strips silence/noise at the source — the main mitigation for "y y y..." hallucination loops. Silero VAD runs on CPU (tiny ONNX model); does not steal GPU cycles from Whisper decoding.
+- **Hallucination retry** (`transcribe_audio` in `transcriber.py`): After a first pass, segments are scanned by `_looks_like_hallucination_loop`. If a short token dominates ≥55% of windows or repeats ≥10 times in a row, a second pass runs with `temperature=(0.0..1.0)`, `beam_size=5`, `best_of=5`, `suppress_tokens=[-1]`. If the retry still loops, `RuntimeError` is raised.
+- **Result shape** (`transcribe_audio`): Returns a dict `{"segments": [{"start","end","text"}, ...], "text": str, "language": str}`. The faster-whisper generator is materialized into this shape so `api.py` and `audio_to_text_file.py` stay agnostic of the backend.
 - **Output format**: Each `.txt` file begins with a header block (`===...`, `filename:...`, `===...`), followed by timestamped segments in `[start - end] text` format.
 - **Supported audio formats**: `.mp3`, `.wav`, `.m4a`, `.ogg`, `.flac`
 - **GPU serialization** (API): An `asyncio.Lock` ensures only one transcription runs at a time. Additional uploads queue.
@@ -92,4 +94,9 @@ uvicorn api:app --host 0.0.0.0 --port 8000
 
 ## GPU / CUDA Notes
 
-CUDA availability is detected at runtime via `torch.cuda.is_available()`. No configuration needed — if a CUDA-compatible GPU is present with the correct PyTorch CUDA build, it will be used automatically. The Docker setup uses `nvidia/cuda:12.1.0-runtime-ubuntu22.04` and requires the NVIDIA Container Toolkit. The `ignore/` directory is gitignored and can be used for local test files.
+CUDA availability is detected at runtime via `torch.cuda.is_available()`. No manual configuration needed — if a CUDA 12 compatible GPU is present with the correct PyTorch CUDA build, it will be used automatically.
+
+- **cuDNN 9 + cuBLAS** are required by CTranslate2 for GPU inference. They are shipped via the `nvidia-cudnn-cu12==9.*` and `nvidia-cublas-cu12` pip wheels (`requirements.txt`), so `pip install -r requirements.txt` covers both host and Docker installs.
+- **Linux / Docker** also needs `LD_LIBRARY_PATH` set to the wheel install dirs so the loader finds the libs. The `Dockerfile` sets this; for a bare-metal Linux host you'll need to export it yourself (Windows does not need it).
+- The Docker setup uses `nvidia/cuda:12.1.0-runtime-ubuntu22.04` and requires the NVIDIA Container Toolkit (or WSL2 GPU passthrough on Windows Docker Desktop).
+- The `ignore/` directory is gitignored and can be used for local test files.
