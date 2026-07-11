@@ -40,6 +40,18 @@ def get_audio_files_status(directory):
     return to_process, excluded
 
 
+def resolve_voices_dir(cli_value):
+    """Resolve the voices directory: CLI flag > env VOICES_DIR > voices/ next to script > disabled."""
+    if cli_value:
+        return cli_value
+    env_value = os.environ.get("VOICES_DIR")
+    if env_value:
+        return env_value
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    default_dir = os.path.join(script_dir, "voices")
+    return default_dir if os.path.isdir(default_dir) else None
+
+
 def print_file_status(to_process, excluded):
     print("\nFiles to be processed:")
     if to_process:
@@ -61,6 +73,13 @@ def main():
     parser.add_argument("directory", type=str, help="Directory containing audio files")
     parser.add_argument("--language", type=str, default=None, help="Language of the audio")
     parser.add_argument("--accept", action="store_true", help="Auto-accept file list without confirmation")
+    parser.add_argument("--align", action="store_true", default=False, help="Run word-level alignment (wav2vec2)")
+    parser.add_argument("--no-diarize", action="store_true", default=False, help="Disable speaker diarization")
+    parser.add_argument(
+        "--voices", type=str, default=None,
+        help="Directory of enrolled reference voices for named speaker ID "
+             "(default: env VOICES_DIR, else 'voices/' next to this script if present, else disabled)",
+    )
     args = parser.parse_args()
 
     directory = os.path.abspath(args.directory)
@@ -89,6 +108,10 @@ def main():
     # Preload model once so first file does not pay the full cold-start cost.
     get_model()
 
+    voices_dir = resolve_voices_dir(args.voices)
+    if voices_dir:
+        print(f"Named speaker ID: enabled ({voices_dir})")
+
     processed_files = []
     failed_files = []
 
@@ -100,7 +123,10 @@ def main():
             output_path = os.path.join(directory, sanitized_txt)
 
             print("Starting transcription...")
-            result = transcribe_audio(audio_file, language=args.language)
+            diarize = False if args.no_diarize else None
+            result = transcribe_audio(
+                audio_file, language=args.language, align=args.align, diarize=diarize, voices_dir=voices_dir
+            )
 
             print("Transcription completed. Saving to:", output_path)
             formatted = format_transcription(os.path.basename(output_path), result["segments"])
