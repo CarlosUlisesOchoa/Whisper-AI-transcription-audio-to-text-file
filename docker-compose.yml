@@ -26,8 +26,10 @@ services:
       - .env
     environment:
       - XDG_CACHE_HOME=/cache
+      - VOICES_DIR=/app/voices
     volumes:
       - whisper-cache:/cache
+      - ./voices:/app/voices
     deploy:
       resources:
         reservations:

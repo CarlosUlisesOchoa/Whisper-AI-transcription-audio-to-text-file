@@ -1,4 +1,8 @@
 ignore/
+ignore-this-dir/
+
+# Personal voice enrollment samples — never commit
+voices/
 
 # WireGuard client config contains private keys — never commit
 wireguard/*.conf

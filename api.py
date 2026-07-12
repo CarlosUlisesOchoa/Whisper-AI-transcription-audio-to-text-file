@@ -1,4 +1,5 @@
 import asyncio
+import functools
 import os
 import shutil
 import tempfile
@@ -12,9 +13,12 @@ from fastapi import FastAPI, File, Form, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
+import speaker_registry
 from security import SecurityMiddleware
 from transcriber import (
     AUDIO_EXTENSIONS,
+    ENABLE_DIARIZATION,
+    HF_TOKEN,
     format_transcription,
     get_device,
     get_model,
@@ -25,6 +29,10 @@ from transcriber import (
 # --- Configuration ---
 JOB_TTL_SECONDS = int(os.environ.get("JOB_TTL_SECONDS", 3600))
 MAX_UPLOAD_SIZE_MB = int(os.environ.get("MAX_UPLOAD_SIZE_MB", 500))
+VOICES_DIR = os.environ.get("VOICES_DIR")
+
+# Set at startup once the registry is preloaded (see lifespan).
+_speaker_id_enabled = False
 
 # --- In-memory job store ---
 # {job_id: {"status": str, "result": str|None, "error": str|None, "created_at": float, "filename": str}}
@@ -49,12 +57,17 @@ def _get_allowed_origins() -> list[str]:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Pre-load the Whisper model on startup so the first request is fast."""
+    """Pre-load the Whisper model (and voice registry, if configured) on startup."""
+    global _speaker_id_enabled
     print("Loading Whisper model on startup...")
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(executor, get_model)
     device = get_device()
     print(f"Model loaded on device: {device}")
+    if VOICES_DIR:
+        registry = await loop.run_in_executor(executor, speaker_registry.load_registry, VOICES_DIR)
+        _speaker_id_enabled = bool(registry)
+        print(f"Speaker registry: {len(registry)} enrolled voice(s)" if registry else "Speaker registry: none found")
     yield
     executor.shutdown(wait=False)
 
@@ -81,9 +94,15 @@ def _cleanup_old_jobs():
         del jobs[jid]
 
 
-def _run_transcription(file_path: str, language: str | None, original_filename: str) -> dict:
+def _run_transcription(
+    file_path: str,
+    language: str | None,
+    original_filename: str,
+    align: bool = False,
+    diarize: bool | None = None,
+) -> dict:
     """Run Whisper transcription (blocking — called via executor)."""
-    result = transcribe_audio(file_path, language=language)
+    result = transcribe_audio(file_path, language=language, align=align, diarize=diarize, voices_dir=VOICES_DIR)
     sanitized_name = sanitize_filename(
         os.path.splitext(original_filename)[0] + ".txt"
     )
@@ -91,15 +110,24 @@ def _run_transcription(file_path: str, language: str | None, original_filename: 
     return {"formatted": formatted, "text": result["text"]}
 
 
-async def _process_job(job_id: str, file_path: str, language: str | None, original_filename: str):
+async def _process_job(
+    job_id: str,
+    file_path: str,
+    language: str | None,
+    original_filename: str,
+    align: bool = False,
+    diarize: bool | None = None,
+):
     """Acquire GPU lock, run transcription, update job status."""
     async with gpu_lock:
         jobs[job_id]["status"] = "processing"
         loop = asyncio.get_event_loop()
         try:
-            result = await loop.run_in_executor(
-                executor, _run_transcription, file_path, language, original_filename
+            fn = functools.partial(
+                _run_transcription, file_path, language, original_filename,
+                align=align, diarize=diarize
             )
+            result = await loop.run_in_executor(executor, fn)
             jobs[job_id]["status"] = "completed"
             jobs[job_id]["result"] = result
         except Exception as e:
@@ -124,6 +152,8 @@ async def health():
         "gpu_name": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
         "queue_depth": queued,
         "jobs_total": len(jobs),
+        "diarization_enabled": bool(HF_TOKEN) and ENABLE_DIARIZATION,
+        "speaker_id_enabled": _speaker_id_enabled,
     }
 
 
@@ -131,6 +161,8 @@ async def health():
 async def transcribe(
     file: UploadFile = File(...),
     language: str | None = Form(default=None),
+    align: bool = Form(default=False),
+    diarize: bool | None = Form(default=None),
 ):
     """Upload an audio file for transcription. Returns a job_id to poll."""
     # Validate file extension
@@ -173,7 +205,7 @@ async def transcribe(
     }
 
     # Fire off background processing
-    asyncio.create_task(_process_job(job_id, tmp_path, language, file.filename or "audio.txt"))
+    asyncio.create_task(_process_job(job_id, tmp_path, language, file.filename or "audio.txt", align=align, diarize=diarize))
 
     _cleanup_old_jobs()
 
