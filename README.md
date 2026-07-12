@@ -295,7 +295,7 @@ If `docker compose logs wireguard` shows `Unable to find module 'wireguard'`, th
 
 ## About developer
 
-Visit my web [Carlos Ochoa](https://carlos8a.com)
+Visit my web [Carlos Ochoa](https://carlos8a.com?ref=gh)
 
 ---
 
