@@ -199,6 +199,11 @@ HF_TOKEN=hf_xxxxxxxxxxxxxxxxxxxx
 
 > **Note:** `/health` is public and does not require the API key.
 
+> **Note on file size / long audio:** there is no 25MB upload limit — that's OpenAI's *hosted*
+> Whisper API cap, not a constraint of this project (whisperX runs locally). The only cap is
+> `MAX_UPLOAD_SIZE_MB` (default `2048`, i.e. ~2GB, sized for a ~2h WAV file), tunable via `.env`.
+> Target envelope is reliably up to **~2 hours** with full diarization + named speaker ID.
+
 For named speaker ID in Docker, drop reference samples into `./voices` on the host — `docker-compose.yml` mounts it to `/app/voices` and sets `VOICES_DIR=/app/voices` automatically. The registry loads once at container startup; there is no per-request upload of voice samples. (Diarization and named ID are verified end-to-end via both the CLI and the API itself — a live `POST /transcribe` returned name-labeled segments. The Docker/WireGuard container stack wraps that same API but hasn't been separately re-verified since these features landed.)
 
 ### 3. Build and start
@@ -273,7 +278,7 @@ curl http://10.0.0.5:8000/jobs/3f8a1c2d-... \
 
 Job status values: `queued` → `processing` → `completed` / `failed`
 
-Completed response includes the full timestamped transcription in `result.formatted` and the plain text in `result.text`. Completed and failed jobs are purged from memory after `JOB_TTL_SECONDS` (default: 1 hour).
+Completed response includes the full timestamped transcription in `result.formatted` and the plain text in `result.text`. Completed and failed jobs are purged from memory after `JOB_TTL_SECONDS` (default: 1 hour), counted from **job completion** — so a long job stays pollable for the full window after it finishes, not from when it was submitted.
 
 ### 7. Stop the service
 

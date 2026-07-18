@@ -2,6 +2,7 @@ import asyncio
 import functools
 import os
 import shutil
+import subprocess
 import tempfile
 import time
 import uuid
@@ -28,7 +29,7 @@ from transcriber import (
 
 # --- Configuration ---
 JOB_TTL_SECONDS = int(os.environ.get("JOB_TTL_SECONDS", 3600))
-MAX_UPLOAD_SIZE_MB = int(os.environ.get("MAX_UPLOAD_SIZE_MB", 500))
+MAX_UPLOAD_SIZE_MB = int(os.environ.get("MAX_UPLOAD_SIZE_MB", 2048))
 VOICES_DIR = os.environ.get("VOICES_DIR")
 
 # Set at startup once the registry is preloaded (see lifespan).
@@ -43,6 +44,19 @@ gpu_lock = asyncio.Lock()
 
 # Thread pool for running blocking whisper transcription
 executor = ThreadPoolExecutor(max_workers=1)
+
+
+def _probe_duration_seconds(file_path: str) -> float | None:
+    """Best-effort audio duration via ffprobe, for observability on long jobs. None on any failure."""
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", file_path],
+            capture_output=True, text=True, timeout=10, check=True,
+        )
+        return float(out.stdout.strip())
+    except Exception:
+        return None
 
 
 def _get_allowed_origins() -> list[str]:
@@ -84,11 +98,12 @@ app.add_middleware(
 
 
 def _cleanup_old_jobs():
-    """Remove jobs older than JOB_TTL_SECONDS."""
+    """Remove jobs older than JOB_TTL_SECONDS, counted from completion (not creation)."""
     now = time.time()
     expired = [
         jid for jid, job in jobs.items()
-        if job["status"] in ("completed", "failed") and now - job["created_at"] > JOB_TTL_SECONDS
+        if job["status"] in ("completed", "failed")
+        and now - job.get("finished_at", job["created_at"]) > JOB_TTL_SECONDS
     ]
     for jid in expired:
         del jobs[jid]
@@ -134,6 +149,7 @@ async def _process_job(
             jobs[job_id]["status"] = "failed"
             jobs[job_id]["error"] = str(e)
         finally:
+            jobs[job_id]["finished_at"] = time.time()
             # Clean up temp file
             if os.path.exists(file_path):
                 os.unlink(file_path)
@@ -203,6 +219,10 @@ async def transcribe(
         "created_at": time.time(),
         "filename": file.filename,
     }
+
+    duration_sec = _probe_duration_seconds(tmp_path)
+    duration_note = f", {duration_sec / 60:.1f} min" if duration_sec is not None else ""
+    print(f"Job {job_id} queued: {file.filename} ({file_size_mb:.1f}MB{duration_note})")
 
     # Fire off background processing
     asyncio.create_task(_process_job(job_id, tmp_path, language, file.filename or "audio.txt", align=align, diarize=diarize))
