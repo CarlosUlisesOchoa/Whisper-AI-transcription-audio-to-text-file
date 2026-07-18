@@ -27,6 +27,8 @@ services:
     environment:
       - XDG_CACHE_HOME=/cache
       - VOICES_DIR=/app/voices
+      # MAX_UPLOAD_SIZE_MB (default 2048) and JOB_TTL_SECONDS (default 3600, counts from job
+      # completion) can be overridden here or in .env — see .env.example.
     volumes:
       - whisper-cache:/cache
       - ./voices:/app/voices

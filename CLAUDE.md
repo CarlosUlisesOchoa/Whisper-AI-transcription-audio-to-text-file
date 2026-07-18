@@ -78,7 +78,8 @@ The project has two modes: **CLI** (batch transcription) and **API** (HTTP servi
 - **Output format**: Each `.txt` file begins with a header block (`===...`, `filename:...`, `===...`), followed by timestamped segments in `[start - end] text` format, or `[start - end] speaker: text` when a `speaker` key is present.
 - **Supported audio formats**: `.mp3`, `.wav`, `.m4a`, `.ogg`, `.flac` (same set for main audio and `voices/` reference samples)
 - **GPU serialization** (API): An `asyncio.Lock` ensures only one transcription runs at a time. Additional uploads queue.
-- **Job lifecycle** (API): Jobs are in-memory. Completed/failed jobs are purged after `JOB_TTL_SECONDS` (default 3600).
+- **Job lifecycle** (API): Jobs are in-memory. Completed/failed jobs are purged after `JOB_TTL_SECONDS` (default 3600) counted from **job completion** (`finished_at`, stamped in `_process_job`'s `finally` block), not from job creation — a long-running job counts its TTL only from when it actually finishes, so it stays pollable for the full window after completion.
+- **Upload size / long audio**: there is **no 25MB limit** in this project — that figure is OpenAI's *hosted* Whisper API upload cap and does not apply here (whisperX runs locally). The only cap is `MAX_UPLOAD_SIZE_MB` (default `2048`, i.e. ~2GB, env-tunable in `api.py`), sized to fit a ~2h WAV file (~1.3GB). The CLI has no size limit at all. whisperX itself handles long-form audio natively via internal VAD chunking — no manual file splitting needed for transcription. Target envelope: reliably up to **~2 hours**, full diarization + named speaker ID; see `dev-docs/long-audio-compatibility.md` for the live-verification plan and results.
 
 ### Environment variables
 
@@ -87,6 +88,8 @@ The project has two modes: **CLI** (batch transcription) and **API** (HTTP servi
 - `HF_TOKEN` — required for diarization and named speaker ID (pyannote model downloads). Missing → both skip gracefully.
 - `VOICES_DIR` — directory of enrolled reference voices. CLI resolution order: `--voices` flag > `VOICES_DIR` env > `voices/` next to the script if it exists > disabled. API: read directly at startup, no per-request override (see Phase 2 below).
 - `SPEAKER_MATCH_THRESHOLD` (default `0.5`) — cosine similarity floor for a name match; tune based on per-speaker best-score log lines.
+- `MAX_UPLOAD_SIZE_MB` (default `2048`) — API upload size cap; raised from the old 500 default to fit a ~2h WAV file. CLI has no equivalent limit.
+- `JOB_TTL_SECONDS` (default `3600`) — API: how long a completed/failed job stays pollable via `GET /jobs/{id}`, counted from completion (see Job lifecycle above).
 
 ### Verification status
 
