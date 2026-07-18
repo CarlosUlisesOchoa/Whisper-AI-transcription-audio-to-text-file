@@ -4,6 +4,7 @@ import re
 import unicodedata
 from collections import Counter
 
+import numpy as np
 import torch
 import whisperx
 from dotenv import load_dotenv
@@ -23,6 +24,9 @@ WHISPER_BATCH_SIZE = int(os.environ.get("WHISPER_BATCH_SIZE", 16))
 HF_TOKEN = os.environ.get("HF_TOKEN", "")
 ENABLE_DIARIZATION = os.environ.get("ENABLE_DIARIZATION", "true").lower() == "true"
 SPEAKER_MATCH_THRESHOLD = float(os.environ.get("SPEAKER_MATCH_THRESHOLD", 0.5))
+AUTO_ENROLL_UNKNOWN = os.environ.get("AUTO_ENROLL_UNKNOWN", "false").lower() == "true"
+ENROLL_MIN_SECONDS = float(os.environ.get("ENROLL_MIN_SECONDS", 10))
+ENROLL_MAX_SECONDS = float(os.environ.get("ENROLL_MAX_SECONDS", 30))
 
 # --- Model singletons ---
 _model = None
@@ -183,7 +187,7 @@ def _materialize_segments(whisperx_result: dict) -> list[dict]:
     ]
 
 
-def transcribe_audio(file_path, language=None, align=False, diarize=None, voices_dir=None):
+def transcribe_audio(file_path, language=None, align=False, diarize=None, voices_dir=None, enroll_unknown=None):
     """Transcribe an audio file and return a result dict with segments and text.
 
     Args:
@@ -193,9 +197,13 @@ def transcribe_audio(file_path, language=None, align=False, diarize=None, voices
         diarize: If True/False, override ENABLE_DIARIZATION env default. None = use env.
         voices_dir: Optional directory of enrolled reference voices for named speaker
             identification. None = feature disabled (SPEAKER_xx labels only).
+        enroll_unknown: If True/False, override AUTO_ENROLL_UNKNOWN env default. None = use env.
+            Auto-captures a voice sample for any diarized speaker unmatched in voices_dir.
     """
     if diarize is None:
         diarize = ENABLE_DIARIZATION
+    if enroll_unknown is None:
+        enroll_unknown = AUTO_ENROLL_UNKNOWN
 
     model = get_model()
     audio = whisperx.load_audio(file_path)
@@ -218,6 +226,7 @@ def transcribe_audio(file_path, language=None, align=False, diarize=None, voices
     result: dict = {
         "segments": segments,
         "language": detected_language,
+        "enrolled_speakers": [],
     }
 
     # Optional: word-level alignment
@@ -251,15 +260,63 @@ def transcribe_audio(file_path, language=None, align=False, diarize=None, voices
 
                 if voices_dir and speaker_embeddings:
                     registry = _get_speaker_registry(voices_dir)
-                    if registry:
-                        name_map = speaker_registry.match_speakers(
-                            speaker_embeddings, registry, SPEAKER_MATCH_THRESHOLD
-                        )
-                        if name_map:
-                            for seg in result["segments"]:
-                                spk = seg.get("speaker")
-                                if spk in name_map:
-                                    seg["speaker"] = name_map[spk]
+                    name_map = (
+                        speaker_registry.match_speakers(speaker_embeddings, registry, SPEAKER_MATCH_THRESHOLD)
+                        if registry else {}
+                    )
+
+                    if enroll_unknown:
+                        unmatched = sorted(label for label in speaker_embeddings if label not in name_map)
+                        if unmatched:
+                            os.makedirs(voices_dir, exist_ok=True)
+                        newly_enrolled: dict = {}
+                        for label in unmatched:
+                            try:
+                                vec = np.asarray(speaker_embeddings[label]).reshape(-1)
+                                if not np.isfinite(vec).all():
+                                    logger.warning("Enrollment skipped for %s: non-finite embedding.", label)
+                                    continue
+
+                                # Within-run dedup: diarization sometimes splits one person
+                                # into multiple clusters — don't enroll the same voice twice.
+                                if newly_enrolled:
+                                    dup_name, dup_score = speaker_registry.best_match(vec, newly_enrolled)
+                                    if dup_name is not None and dup_score >= SPEAKER_MATCH_THRESHOLD:
+                                        name_map[label] = dup_name
+                                        continue
+
+                                speaker_turns = diarize_segments.loc[
+                                    diarize_segments["speaker"] == label, ["start", "end"]
+                                ].values.tolist()
+                                other_turns = diarize_segments.loc[
+                                    diarize_segments["speaker"] != label, ["start", "end"]
+                                ].values.tolist()
+                                sample = speaker_registry.extract_speaker_sample(
+                                    audio, speaker_turns, other_turns,
+                                    min_seconds=ENROLL_MIN_SECONDS, max_seconds=ENROLL_MAX_SECONDS,
+                                )
+                                if sample is None:
+                                    logger.info(
+                                        "Enrollment skipped for %s: less than %.0fs usable speech.",
+                                        label, ENROLL_MIN_SECONDS,
+                                    )
+                                    continue
+
+                                new_name = speaker_registry.next_unknown_name(voices_dir)
+                                new_vec = speaker_registry.enroll_speaker(sample, voices_dir, new_name, HF_TOKEN)
+                                registry[new_name] = new_vec
+                                newly_enrolled[new_name] = new_vec
+                                name_map[label] = new_name
+                                result["enrolled_speakers"].append(new_name)
+                                logger.info("Enrolled new speaker %s as %s", label, new_name)
+                            except Exception as e:
+                                logger.warning("Enrollment skipped for %s: %s", label, e)
+
+                    if name_map:
+                        for seg in result["segments"]:
+                            spk = seg.get("speaker")
+                            if spk in name_map:
+                                seg["speaker"] = name_map[spk]
             except Exception as e:
                 logger.warning("Diarization skipped: %s", e)
 

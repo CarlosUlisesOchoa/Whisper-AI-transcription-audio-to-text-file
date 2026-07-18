@@ -40,8 +40,12 @@ def get_audio_files_status(directory):
     return to_process, excluded
 
 
-def resolve_voices_dir(cli_value):
-    """Resolve the voices directory: CLI flag > env VOICES_DIR > voices/ next to script > disabled."""
+def resolve_voices_dir(cli_value, enroll_unknown=False):
+    """Resolve the voices directory: CLI flag > env VOICES_DIR > voices/ next to script > disabled.
+
+    When enroll_unknown is set and nothing else resolves, default to voices/
+    next to the script anyway — enrollment needs a destination and will create it.
+    """
     if cli_value:
         return cli_value
     env_value = os.environ.get("VOICES_DIR")
@@ -49,7 +53,9 @@ def resolve_voices_dir(cli_value):
         return env_value
     script_dir = os.path.dirname(os.path.abspath(__file__))
     default_dir = os.path.join(script_dir, "voices")
-    return default_dir if os.path.isdir(default_dir) else None
+    if os.path.isdir(default_dir) or enroll_unknown:
+        return default_dir
+    return None
 
 
 def print_file_status(to_process, excluded):
@@ -80,6 +86,10 @@ def main():
         help="Directory of enrolled reference voices for named speaker ID "
              "(default: env VOICES_DIR, else 'voices/' next to this script if present, else disabled)",
     )
+    parser.add_argument(
+        "--enroll-unknown", action="store_true", default=False,
+        help="Auto-enroll unmatched speakers into the voices dir as unknown-NN.wav",
+    )
     args = parser.parse_args()
 
     directory = os.path.abspath(args.directory)
@@ -108,9 +118,11 @@ def main():
     # Preload model once so first file does not pay the full cold-start cost.
     get_model()
 
-    voices_dir = resolve_voices_dir(args.voices)
+    voices_dir = resolve_voices_dir(args.voices, args.enroll_unknown)
     if voices_dir:
         print(f"Named speaker ID: enabled ({voices_dir})")
+    if args.enroll_unknown:
+        print(f"Auto-enroll unknown speakers: enabled ({voices_dir})")
 
     processed_files = []
     failed_files = []
@@ -124,8 +136,10 @@ def main():
 
             print("Starting transcription...")
             diarize = False if args.no_diarize else None
+            enroll_unknown = True if args.enroll_unknown else None
             result = transcribe_audio(
-                audio_file, language=args.language, align=args.align, diarize=diarize, voices_dir=voices_dir
+                audio_file, language=args.language, align=args.align, diarize=diarize,
+                voices_dir=voices_dir, enroll_unknown=enroll_unknown,
             )
 
             print("Transcription completed. Saving to:", output_path)
@@ -133,6 +147,8 @@ def main():
             with open(output_path, 'w', encoding='utf-8') as f:
                 f.write(formatted)
             print(formatted, end='')
+            for name in result.get("enrolled_speakers", []):
+                print(f"✓ Enrolled new speaker: voices/{name}.wav")
             processed_files.append(audio_file)
         except Exception as e:
             print(f"Error processing {os.path.basename(audio_file)}: {str(e)}")

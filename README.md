@@ -13,6 +13,7 @@ Two run modes:
 - GPU acceleration with CUDA 12.8 (float16) + automatic CPU fallback (int8)
 - **Speaker diarization** — labels each segment `SPEAKER_00`, `SPEAKER_01`, etc. (pyannote 3.1)
 - **Named speaker identification** — enroll reference voices in `voices/` and get real names instead of `SPEAKER_xx`
+- **Auto-enroll unknown speakers** (opt-in) — captures a sample from any unmatched speaker and saves it as `voices/unknown-NN.wav`; rename it once and that person is identified automatically from then on
 - Optional word-level alignment (`--align`, wav2vec2)
 - Built-in VAD filter — strips silence/noise to reduce hallucination loops
 - Automatic hallucination-loop detection with retry on higher-temperature settings
@@ -43,6 +44,9 @@ py audio_to_text_file.py "path/to/audio/folder" --no-diarize
 
 # Named speaker identification from a custom voices folder
 py audio_to_text_file.py "path/to/audio/folder" --voices "D:\my-voices"
+
+# Auto-enroll unmatched speakers as voices/unknown-NN.wav
+py audio_to_text_file.py "path/to/audio/folder" --enroll-unknown
 ```
 
 Available arguments:
@@ -53,6 +57,7 @@ Available arguments:
 - `--align`: Run word-level alignment (wav2vec2), adds per-word timings (optional, off by default)
 - `--no-diarize`: Disable speaker diarization for this run (optional; diarization is on by default when `HF_TOKEN` is set)
 - `--voices <dir>`: Directory of enrolled reference voices for named speaker ID (optional; default: env `VOICES_DIR`, else `voices/` next to the script if present, else disabled)
+- `--enroll-unknown`: Auto-enroll speakers unmatched in the voices dir as `unknown-NN.wav` (optional, off by default; also settable via `AUTO_ENROLL_UNKNOWN` env)
 
 ## 🔧 Requirements
 
@@ -150,6 +155,25 @@ With voices enrolled, matching segments show the real name instead of `SPEAKER_x
 
 **Known limitation**: diarization quality degrades on heavy overlapping speech/crosstalk (a whisperX/pyannote limitation, not specific to this project).
 
+### Auto-enroll unknown speakers (opt-in)
+
+Instead of manually recording a reference sample for every new person, pass `--enroll-unknown` (CLI) or `enroll_unknown=true` (API form field), or set `AUTO_ENROLL_UNKNOWN=true` in `.env` as a process-wide default. Any diarized speaker with **no** match in `voices/` gets a 10–30 s sample spliced from their own turns and saved as `voices/unknown-01.wav`, `unknown-02.wav`, etc. — that speaker's segments are labeled `unknown-NN` in the transcript right away.
+
+```
+[12.34s - 15.78s] unknown-01: hola, ¿cómo estás?
+[16.02s - 18.40s] SPEAKER_02: bien, ¿y vos?
+```
+
+`SPEAKER_02` stayed anonymous because it had under 10 s of usable speech (`ENROLL_MIN_SECONDS`, env-tunable) — too little audio for a reliable sample.
+
+**Rename to identify permanently**: listen to `voices/unknown-01.wav`, rename it to the person's real name (e.g. `maria.wav`). Every future run matches that voice by name automatically — no re-enrollment needed. Renaming two files to the same person needs distinct stems (`carlos.wav`, `carlos-2.wav`); prefer deleting the weaker duplicate.
+
+Notes:
+- A speaker already matched in `voices/` is never re-enrolled.
+- If diarization splits one person into two clusters in the same run, the second cluster is matched against the first's freshly-written sample instead of creating a duplicate file.
+- Without the flag (and `AUTO_ENROLL_UNKNOWN` unset), nothing is written to `voices/` — behavior is unchanged.
+- Requires `HF_TOKEN` (same as diarization/named ID) — missing token logs a warning and skips enrollment without failing the transcription.
+
 ## 🐳 Docker / API Mode
 
 The project includes a **FastAPI HTTP server** that exposes Whisper as a remote transcription service. It is fully Dockerized with GPU support and **exposed exclusively through a [WireGuard](https://www.wireguard.com/) tunnel** — nothing binds to LAN or a public interface.
@@ -204,7 +228,7 @@ HF_TOKEN=hf_xxxxxxxxxxxxxxxxxxxx
 > `MAX_UPLOAD_SIZE_MB` (default `2048`, i.e. ~2GB, sized for a ~2h WAV file), tunable via `.env`.
 > Target envelope is reliably up to **~2 hours** with full diarization + named speaker ID.
 
-For named speaker ID in Docker, drop reference samples into `./voices` on the host — `docker-compose.yml` mounts it to `/app/voices` and sets `VOICES_DIR=/app/voices` automatically. The registry loads once at container startup; there is no per-request upload of voice samples. (Diarization and named ID are verified end-to-end via both the CLI and the API itself — a live `POST /transcribe` returned name-labeled segments. The Docker/WireGuard container stack wraps that same API but hasn't been separately re-verified since these features landed.)
+For named speaker ID in Docker, drop reference samples into `./voices` on the host — `docker-compose.yml` mounts it to `/app/voices` and sets `VOICES_DIR=/app/voices` automatically. The registry loads once at container startup; there is no per-request upload of voice samples. Auto-enroll (`enroll_unknown=true` form field, see step 5 below) writes new `unknown-NN.wav` samples straight into that same mounted folder, so they land on the host and survive container restarts. (Diarization and named ID are verified end-to-end via both the CLI and the API itself — a live `POST /transcribe` returned name-labeled segments. The Docker/WireGuard container stack wraps that same API but hasn't been separately re-verified since these features landed.)
 
 ### 3. Build and start
 
@@ -256,12 +280,13 @@ curl -X POST http://10.0.0.5:8000/transcribe \
   -F "file=@recording.mp3" \
   -F "language=en" \
   -F "align=false" \
-  -F "diarize=true"
+  -F "diarize=true" \
+  -F "enroll_unknown=true"
 ```
 
 Supported formats: `.mp3`, `.wav`, `.m4a`, `.ogg`, `.flac`
 
-`language` is optional — omit it for automatic language detection. `align` and `diarize` are optional booleans (default: no alignment; diarization follows the server's `ENABLE_DIARIZATION` env default). Named speaker ID has no per-request field — it's driven by the `voices/` folder mounted at startup (see below).
+`language` is optional — omit it for automatic language detection. `align`, `diarize`, and `enroll_unknown` are optional booleans (default: no alignment; diarization and auto-enroll follow the server's `ENABLE_DIARIZATION`/`AUTO_ENROLL_UNKNOWN` env defaults). Named speaker ID itself has no per-request field — it's driven by the `voices/` folder mounted at startup (see above); `enroll_unknown=true` auto-populates that same folder with new `unknown-NN.wav` samples for any speaker it doesn't already match.
 
 Response:
 
