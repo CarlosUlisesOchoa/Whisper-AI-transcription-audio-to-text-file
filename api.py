@@ -15,6 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 import speaker_registry
+import transcriber
 from security import SecurityMiddleware
 from transcriber import (
     AUDIO_EXTENSIONS,
@@ -115,14 +116,18 @@ def _run_transcription(
     original_filename: str,
     align: bool = False,
     diarize: bool | None = None,
+    enroll_unknown: bool | None = None,
 ) -> dict:
     """Run Whisper transcription (blocking — called via executor)."""
-    result = transcribe_audio(file_path, language=language, align=align, diarize=diarize, voices_dir=VOICES_DIR)
+    result = transcribe_audio(
+        file_path, language=language, align=align, diarize=diarize,
+        voices_dir=VOICES_DIR, enroll_unknown=enroll_unknown,
+    )
     sanitized_name = sanitize_filename(
         os.path.splitext(original_filename)[0] + ".txt"
     )
     formatted = format_transcription(sanitized_name, result["segments"])
-    return {"formatted": formatted, "text": result["text"]}
+    return {"formatted": formatted, "text": result["text"], "enrolled_speakers": result.get("enrolled_speakers", [])}
 
 
 async def _process_job(
@@ -132,6 +137,7 @@ async def _process_job(
     original_filename: str,
     align: bool = False,
     diarize: bool | None = None,
+    enroll_unknown: bool | None = None,
 ):
     """Acquire GPU lock, run transcription, update job status."""
     async with gpu_lock:
@@ -140,7 +146,7 @@ async def _process_job(
         try:
             fn = functools.partial(
                 _run_transcription, file_path, language, original_filename,
-                align=align, diarize=diarize
+                align=align, diarize=diarize, enroll_unknown=enroll_unknown,
             )
             result = await loop.run_in_executor(executor, fn)
             jobs[job_id]["status"] = "completed"
@@ -162,6 +168,8 @@ async def health():
     """Health check — no auth required."""
     _cleanup_old_jobs()
     queued = sum(1 for j in jobs.values() if j["status"] in ("queued", "processing"))
+    cached_registry = transcriber._speaker_registry_cache.get(VOICES_DIR)
+    speaker_id_enabled = bool(cached_registry) if cached_registry is not None else _speaker_id_enabled
     return {
         "status": "ok",
         "device": get_device(),
@@ -169,7 +177,7 @@ async def health():
         "queue_depth": queued,
         "jobs_total": len(jobs),
         "diarization_enabled": bool(HF_TOKEN) and ENABLE_DIARIZATION,
-        "speaker_id_enabled": _speaker_id_enabled,
+        "speaker_id_enabled": speaker_id_enabled,
     }
 
 
@@ -179,6 +187,7 @@ async def transcribe(
     language: str | None = Form(default=None),
     align: bool = Form(default=False),
     diarize: bool | None = Form(default=None),
+    enroll_unknown: bool | None = Form(default=None),
 ):
     """Upload an audio file for transcription. Returns a job_id to poll."""
     # Validate file extension
@@ -225,7 +234,10 @@ async def transcribe(
     print(f"Job {job_id} queued: {file.filename} ({file_size_mb:.1f}MB{duration_note})")
 
     # Fire off background processing
-    asyncio.create_task(_process_job(job_id, tmp_path, language, file.filename or "audio.txt", align=align, diarize=diarize))
+    asyncio.create_task(_process_job(
+        job_id, tmp_path, language, file.filename or "audio.txt",
+        align=align, diarize=diarize, enroll_unknown=enroll_unknown,
+    ))
 
     _cleanup_old_jobs()
 
