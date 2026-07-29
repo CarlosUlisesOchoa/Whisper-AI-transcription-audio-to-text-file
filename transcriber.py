@@ -187,6 +187,86 @@ def _materialize_segments(whisperx_result: dict) -> list[dict]:
     ]
 
 
+def _align_segments(segments: list[dict], audio, language_code: str) -> None:
+    """Run wav2vec2 alignment and attach a 'words' array to each segment in place. Raises on failure.
+
+    whisperx.align() re-segments internally by sentence, so its output segment list is not
+    1:1 with our input segments (different count/order) — words must be bucketed back onto
+    the original segments by timestamp via align_result['word_segments'], not by list index.
+    Each word's aligned start/end is mathematically bounded within its source segment's own
+    [start, end] window (alignment runs on that segment's audio slice), so a chronological
+    walk against segment boundaries is exact, not a heuristic.
+    """
+    model_a, metadata = _get_align_model(language_code)
+    align_result = whisperx.align(
+        segments, model_a, metadata, audio, get_device(),
+        return_char_alignments=False,
+    )
+    for seg in segments:
+        seg["words"] = []
+
+    seg_idx = 0
+    for word in align_result.get("word_segments", []):
+        word_start = word.get("start")
+        if word_start is not None:
+            while seg_idx + 1 < len(segments) and word_start >= segments[seg_idx + 1]["start"]:
+                seg_idx += 1
+        segments[seg_idx]["words"].append(word)
+
+
+def _split_segments_by_word_speaker(segments: list[dict]) -> list[dict]:
+    """Split segments at word-speaker-change boundaries so short interjections get their own line."""
+    output = []
+    for seg in segments:
+        words = seg.get("words")
+        if not words:
+            output.append(seg)
+            continue
+
+        distinct_speakers = {w["speaker"] for w in words if w.get("speaker")}
+        if len(distinct_speakers) <= 1:
+            output.append(seg)
+            continue
+
+        groups: list[dict] = []
+        for word in words:
+            speaker = word.get("speaker")
+            if speaker is None or "start" not in word:
+                # Unlabeled/unaligned words never open a new group.
+                if groups:
+                    groups[-1]["words"].append(word)
+                else:
+                    groups.append({"speaker": None, "words": [word]})
+                continue
+
+            if groups and groups[-1]["speaker"] in (speaker, None):
+                groups[-1]["speaker"] = speaker
+                groups[-1]["words"].append(word)
+            else:
+                groups.append({"speaker": speaker, "words": [word]})
+
+        for gi, group in enumerate(groups):
+            group_words = group["words"]
+            if gi == 0:
+                start = seg["start"]
+            else:
+                start = next((w["start"] for w in group_words if "start" in w), seg["start"])
+            if gi == len(groups) - 1:
+                end = seg["end"]
+            else:
+                end = next((w["end"] for w in reversed(group_words) if "end" in w), seg["end"])
+
+            output.append({
+                "start": start,
+                "end": end,
+                "text": " ".join(w["word"] for w in group_words).strip(),
+                "speaker": group["speaker"],
+                "words": group_words,
+            })
+
+    return output
+
+
 def transcribe_audio(file_path, language=None, align=False, diarize=None, voices_dir=None, enroll_unknown=None):
     """Transcribe an audio file and return a result dict with segments and text.
 
@@ -229,18 +309,14 @@ def transcribe_audio(file_path, language=None, align=False, diarize=None, voices
         "enrolled_speakers": [],
     }
 
+    words_requested = align
+    aligned = False
+
     # Optional: word-level alignment
     if align:
         try:
-            model_a, metadata = _get_align_model(detected_language)
-            align_result = whisperx.align(
-                result["segments"], model_a, metadata, audio, get_device(),
-                return_char_alignments=False,
-            )
-            for i, seg in enumerate(result["segments"]):
-                aligned_seg = align_result["segments"][i] if i < len(align_result["segments"]) else {}
-                if "words" in aligned_seg:
-                    seg["words"] = aligned_seg["words"]
+            _align_segments(result["segments"], audio, detected_language)
+            aligned = True
         except Exception as e:
             logger.warning("Word alignment skipped: %s", e)
 
@@ -250,13 +326,23 @@ def transcribe_audio(file_path, language=None, align=False, diarize=None, voices
             logger.warning("Diarization skipped: HF_TOKEN not set.")
         else:
             try:
+                if not aligned:
+                    # Word-level attribution needs per-word timings even if the caller
+                    # didn't ask for --align; fall back to segment-level attribution on failure.
+                    try:
+                        _align_segments(result["segments"], audio, detected_language)
+                        aligned = True
+                    except Exception as e:
+                        logger.warning("Word-level alignment for speaker attribution skipped: %s", e)
+
                 pipeline = _get_diarize_pipeline()
                 diarize_segments, speaker_embeddings = pipeline(audio, return_embeddings=True)
-                diarized = whisperx.assign_word_speakers(diarize_segments, result)
-                for i, seg in enumerate(result["segments"]):
-                    diarized_seg = diarized["segments"][i] if i < len(diarized["segments"]) else {}
-                    if "speaker" in diarized_seg:
-                        seg["speaker"] = diarized_seg["speaker"]
+                whisperx.assign_word_speakers(diarize_segments, result)
+
+                result["segments"] = _split_segments_by_word_speaker(result["segments"])
+                if not words_requested:
+                    for seg in result["segments"]:
+                        seg.pop("words", None)
 
                 if voices_dir and speaker_embeddings:
                     registry = _get_speaker_registry(voices_dir)
@@ -317,6 +403,11 @@ def transcribe_audio(file_path, language=None, align=False, diarize=None, voices
                             spk = seg.get("speaker")
                             if spk in name_map:
                                 seg["speaker"] = name_map[spk]
+                            if words_requested:
+                                for w in seg.get("words", []):
+                                    wspk = w.get("speaker")
+                                    if wspk in name_map:
+                                        w["speaker"] = name_map[wspk]
             except Exception as e:
                 logger.warning("Diarization skipped: %s", e)
 

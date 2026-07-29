@@ -126,6 +126,8 @@ With `HF_TOKEN` set (see Installation step 4), diarization is **on by default**:
 [12.34s - 15.78s] SPEAKER_01: hola, ¿cómo estás?
 ```
 
+Short interjections from another speaker get their own labeled line instead of being folded into whoever's talk dominates that stretch — word-level alignment runs automatically whenever diarization is on (no extra flag; first diarized run downloads a ~360 MB alignment model).
+
 ### Enroll real names
 
 Drop one clean 10–30 s reference sample per person into a `voices/` folder (next to the script, or point `--voices`/`VOICES_DIR` elsewhere). The filename (without extension) becomes the name used in the output — capitalization is up to you:
