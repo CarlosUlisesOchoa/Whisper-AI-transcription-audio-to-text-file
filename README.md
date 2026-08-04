@@ -2,10 +2,11 @@
 
 A Python transcription tool powered by [`whisperX`](https://github.com/m-bain/whisperX) (CTranslate2 backend under the hood, same as `faster-whisper`) — adds **speaker diarization** (pyannote) and **named speaker identification** on top of fast GPU transcription.
 
-Two run modes:
+Three run modes:
 
 - **CLI** — batch-transcribe a folder of audio files (`audio_to_text_file.py`).
 - **API** — FastAPI HTTP service with async job queue, exposed only over a WireGuard tunnel (`api.py`).
+- **Watcher** — host-side agent that continuously syncs Google Drive folders against the API, so a dropped voice memo gets transcribed on its own (`watcher.py`).
 
 ## 🌟 Features
 
@@ -268,7 +269,8 @@ Example response:
   "queue_depth": 0,
   "jobs_total": 0,
   "diarization_enabled": true,
-  "speaker_id_enabled": true
+  "speaker_id_enabled": true,
+  "watcher_trigger_configured": true
 }
 ```
 
@@ -318,6 +320,167 @@ The Whisper model cache is stored in a Docker volume (`whisper-cache`) so it sur
 ### Troubleshooting: WireGuard kernel module on Windows Docker Desktop (WSL2)
 
 If `docker compose logs wireguard` shows `Unable to find module 'wireguard'`, the WG kernel module is missing. Enable userspace mode by adding `- USE_BORINGTUN=true` to the `wireguard` service `environment:` in `docker-compose.yml`. Slight throughput hit, no other change.
+
+## 📁 Watched-folder sync (`watcher.py`)
+
+A host-side agent that keeps configured folders continuously in sync: any audio file lacking its
+sanitized `.txt` transcript gets submitted to the `whisper-api` container, and the result is written
+back next to the audio — no manual CLI run needed. Built for the case where audio lives on a
+**Google Drive Desktop** virtual drive (`G:\Mi unidad\...`): that mount is per-user and cannot be
+bind-mounted into the WSL2-backed Docker containers, so the watcher must run on the host as a thin
+client, not a second GPU process.
+
+**Requirements**: the `whisper-api` container running (`docker compose up -d`), reachable at
+`http://127.0.0.1:8000` on the host — `docker-compose.yml` publishes that port on the `wireguard`
+service's `127.0.0.1` loopback (WireGuard peers still reach the API over the tunnel IP as before;
+nothing new is exposed to the LAN or internet). Only the thin-client deps are needed on the host —
+no torch/whisperX:
+
+```bash
+pip install -r requirements-watcher.txt
+```
+
+### Configure
+
+```bash
+cp watch-config.example.yaml watch-config.yaml
+```
+
+Edit `watch-config.yaml` (git-ignored — contains local machine paths) and list the folders to
+watch, each with its own language and transcription flags:
+
+```yaml
+api:
+  enabled: true                # false = no automatic scanning; POST /watcher/trigger still works
+  poll_interval_seconds: 3600  # how often roots are automatically rescanned (default: hourly)
+
+watch:
+  - path: "G:\\Mi unidad\\Documents GDrive\\Voice Memos Work\\test"
+    recursive: true
+    language: es
+    align: true
+    diarize: true
+    enroll_unknown: true
+```
+
+The API key is read from `API_KEY` in `.env` / the environment — never stored in this file.
+
+Set `api.enabled: false` to turn off automatic scanning without uninstalling the Scheduled Task —
+the process stays running (so it can still respond to a manual trigger, see below), it just never
+scans on its own.
+
+### Run
+
+```bash
+# Preview what would be queued right now, submit nothing (safe first check on a new root)
+py watcher.py --dry-run
+
+# Single sync pass, then exit (manual catch-up / testing)
+py watcher.py --once
+
+# Continuous — the intended mode, started at logon (see below)
+py watcher.py
+
+# Clear backoff/attempt counters and retry everything that had given up
+py watcher.py --retry-failed
+```
+
+Set `$env:PYTHONUTF8=1` first, same reason as the CLI (console `✓`/`✗` output).
+
+### Run continuously at logon (Windows Scheduled Task)
+
+```powershell
+# From an elevated PowerShell:
+.\scripts\register-watcher-task.ps1
+
+# To remove it later:
+.\scripts\unregister-watcher-task.ps1
+```
+
+Registers a task that starts `watcher.py` **at logon, as your interactive user** — not as
+`SYSTEM`, since Google Drive only mounts `G:` in the logged-on user's session. Restarts on failure,
+no execution time limit (a ~2h transcription must be allowed to finish), survives being on battery.
+
+### How it works
+
+- A file must be size/mtime-stable for `stability_seconds` (default 60s) before submission — this
+  is what prevents a half-uploaded/half-downloaded Drive file from being transcribed truncated.
+- Root unavailable (Drive app not running, `G:` not mounted yet)? Logged once per state transition,
+  never crashes — resumes automatically once the drive reappears.
+- State (`%LOCALAPPDATA%\whisper-watcher\state.json`) tracks in-flight jobs and failure backoff only
+  — the `.txt` file remains the sole source of truth for "done". Deleting `state.json` is always
+  safe.
+- Failed jobs retry with exponential backoff up to `max_attempts`, then are skipped (logged) without
+  blocking other files.
+- `enrolled_speakers` from `--enroll-unknown`-style auto-enrollment are logged per completed job so
+  you know which new `voices/unknown-NN.wav` files showed up to rename.
+
+### Manually trigger a scan (`POST /watcher/trigger`)
+
+Since the scan interval defaults to once an hour, you may not want to wait for the next automatic
+pass. `POST /watcher/trigger` is exposed on `whisper-api` — reachable from **any device on the
+WireGuard network**, same as `/transcribe` — and asks the host watcher to run a sync pass now:
+
+```bash
+curl -X POST http://10.0.0.5:8000/watcher/trigger \
+  -H "X-API-Key: your-api-key"
+```
+
+```json
+{
+  "status": "triggered",
+  "note": "Signal written. The host watcher picks it up within a few seconds if it is running..."
+}
+```
+
+**How it works, and its one real limitation**: `watcher.py` runs on the host (outside Docker) because
+it needs direct access to the Google Drive mount — the container has no way to reach a host process
+directly. So this endpoint writes a signal file into `./watcher-control`, a folder bind-mounted into
+the container (`WATCHER_CONTROL_DIR=/app/watcher-control`); the host watcher polls that same folder
+every `control_check_seconds` (default 5s) regardless of the hourly schedule, and runs a sync pass
+the moment it sees the signal. Because there's no channel back from host to container, **this
+endpoint cannot confirm the watcher actually picked up the trigger** — only that the signal was
+written. If the watcher isn't running (crashed, not registered via the Scheduled Task, etc.), the
+signal is silently consumed next time it starts. Check `watcher.log` on the host, or just watch for
+new `.txt` files, to confirm a triggered scan actually ran.
+
+Returns `503` if `WATCHER_CONTROL_DIR` isn't configured on the server.
+
+**Logging**: every request to this endpoint is recorded — both to the container's own stdout
+(`docker compose logs whisper-api`) and, since container logs are easy to lose across a restart,
+to `watcher-control/trigger.log` on the host (rotating, 1MB × 2 backups) — visible right next to
+`watcher.log`. Every directory scan is logged too, whether it found anything or not: `watcher.log`
+now has a `Scan starting (source=...)` / `Scan finished (source=...): N found, M submitted` pair
+for every tick, where `source` is `scheduled`, `manual` (this endpoint), or `once` (`--once`).
+
+### Is the watcher actually running?
+
+There's no single command for this — check whichever of the following fits what you're diagnosing:
+
+- **Is the Scheduled Task itself alive?**
+  ```powershell
+  Get-ScheduledTask -TaskName WhisperWatcher | Get-ScheduledTaskInfo
+  ```
+  Shows `LastRunTime`, `LastTaskResult` (`0` = success), and `NextRunTime`. This confirms Task
+  Scheduler *launched* it at last logon — not that the process is still alive right now (a crashed
+  watcher still shows a successful last run).
+- **Is a `watcher.py` process actually alive right now?** `pythonw.exe` alone doesn't say which
+  script it's running, so match on the command line:
+  ```powershell
+  Get-CimInstance Win32_Process -Filter "Name='pythonw.exe'" |
+    Where-Object { $_.CommandLine -like '*watcher.py*' }
+  ```
+  Any rows returned = it's running.
+- **Is it actually doing anything (not hung)?** Tail the log and check the timestamp on the most
+  recent `Scan starting`/`Scan finished` line:
+  ```powershell
+  Get-Content $env:LOCALAPPDATA\whisper-watcher\watcher.log -Tail 20 -Wait
+  ```
+  With every tick now logged (see above), a last-scan timestamp older than
+  `poll_interval_seconds` (+ a margin) means it's stuck or dead, not just idle.
+- **Don't confuse this with `/health`'s `watcher_trigger_configured`** — that only reports whether
+  the *container* has `WATCHER_CONTROL_DIR` wired up (i.e., whether a trigger *could* reach the
+  watcher). It's `true` regardless of whether the host watcher process is actually running.
 
 ---
 

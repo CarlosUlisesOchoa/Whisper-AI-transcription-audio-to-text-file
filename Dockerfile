@@ -26,7 +26,7 @@ COPY requirements.txt .
 RUN pip3 install --no-cache-dir -r requirements.txt
 
 # Copy application code
-COPY transcriber.py speaker_registry.py security.py api.py audio_to_text_file.py ./
+COPY naming.py transcriber.py speaker_registry.py security.py api.py audio_to_text_file.py ./
 
 EXPOSE 8000
 

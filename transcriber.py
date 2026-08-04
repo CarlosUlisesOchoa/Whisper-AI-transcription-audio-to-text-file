@@ -1,7 +1,6 @@
 import logging
 import os
 import re
-import unicodedata
 from collections import Counter
 
 import numpy as np
@@ -11,12 +10,11 @@ from dotenv import load_dotenv
 from whisperx.diarize import DiarizationPipeline
 
 import speaker_registry
+from naming import AUDIO_EXTENSIONS, ACCENTED_VOWEL_TRANSLATION, sanitize_filename
 
 load_dotenv()
 
 logger = logging.getLogger(__name__)
-
-AUDIO_EXTENSIONS = {'.mp3', '.wav', '.m4a', '.ogg', '.flac'}
 
 # --- Configuration from environment ---
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "medium")
@@ -51,24 +49,6 @@ RETRY_ASR_OPTIONS = {
     "beam_size": 5,
     "best_of": 5,
 }
-
-ACCENTED_VOWEL_TRANSLATION = str.maketrans("áéíóú", "aeiou")
-
-
-def sanitize_filename(filename):
-    """Sanitize a filename: lowercase, replace unknown characters with dashes, collapse dashes and transliterate accented vowels."""
-    base_name = os.path.splitext(filename)[0]
-    extension = os.path.splitext(filename)[1]
-
-    # Normalize first so composed and decomposed accents are treated the same.
-    sanitized = unicodedata.normalize("NFC", base_name.lower())
-    sanitized = sanitized.translate(ACCENTED_VOWEL_TRANSLATION)
-    sanitized = re.sub(r'[^a-z0-9-_]', '-', sanitized)
-    sanitized = re.sub(r'-+', '-', sanitized)
-    sanitized = sanitized.strip('-')
-
-    return sanitized + extension
-
 
 def get_device():
     """Return 'cuda' if available, else 'cpu'."""
