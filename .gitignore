@@ -4,6 +4,12 @@ ignore-this-dir/
 # Personal voice enrollment samples — never commit
 voices/
 
+# Watcher config contains local machine paths — never commit
+watch-config.yaml
+
+# Watcher <-> API trigger signal directory — local runtime state, not code
+watcher-control/
+
 # WireGuard client config contains private keys — never commit
 wireguard/*.conf
 wireguard/*.conf.*

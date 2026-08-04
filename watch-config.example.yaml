@@ -1,0 +1,34 @@
+# Copy this file to watch-config.yaml (gitignored — contains local machine paths)
+# and edit the `watch` list below to point at your Google Drive folders.
+
+api:
+  base_url: http://127.0.0.1:8000
+  # API key is read from the API_KEY env var / .env — never stored in this file.
+  enabled: true                  # false = no automatic scanning; manual triggers via POST /watcher/trigger still work
+  poll_interval_seconds: 3600    # how often each root is automatically rescanned (default: hourly)
+  control_check_seconds: 5       # how often to check for a manual-trigger signal, independent of the above
+  stability_seconds: 60          # a file must be size-stable this long before submission
+  job_poll_seconds: 10           # how often an in-flight job is polled
+  job_timeout_seconds: 14400     # 4h ceiling — a ~2h file must fit comfortably
+  max_inflight: 1                # outstanding jobs at once
+  max_files_per_cycle: 5         # backlog throttle
+  order: newest_first            # newest_first | oldest_first
+  max_attempts: 5                # give up (mark failed, stop retrying) after this many failures
+  backoff_base_seconds: 60       # first retry delay; doubles each attempt (exponential backoff)
+  backoff_max_seconds: 3600      # cap on the backoff delay
+
+watch:
+  - path: "G:\\Mi unidad\\Documents GDrive\\Voice Memos Work\\test"
+    recursive: true
+    language: es
+    align: true
+    diarize: true
+    enroll_unknown: true
+
+  # Add more roots here; each carries its own language and flags.
+  # - path: "G:\\Mi unidad\\Documents GDrive\\Some Other Folder"
+  #   recursive: false
+  #   language: en
+  #   align: true
+  #   diarize: true
+  #   enroll_unknown: false

@@ -1,5 +1,7 @@
 import asyncio
 import functools
+import logging
+import logging.handlers
 import os
 import shutil
 import subprocess
@@ -10,7 +12,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 
 import torch
-from fastapi import FastAPI, File, Form, UploadFile
+from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
@@ -32,6 +34,32 @@ from transcriber import (
 JOB_TTL_SECONDS = int(os.environ.get("JOB_TTL_SECONDS", 3600))
 MAX_UPLOAD_SIZE_MB = int(os.environ.get("MAX_UPLOAD_SIZE_MB", 2048))
 VOICES_DIR = os.environ.get("VOICES_DIR")
+# Bind-mounted from ./watcher-control on the host — see docker-compose.yml. The host-side
+# watcher.py process (outside Docker; it needs direct access to the Google Drive mount) polls
+# this same directory for a trigger file, since the container has no way to reach a host process.
+WATCHER_CONTROL_DIR = os.environ.get("WATCHER_CONTROL_DIR")
+WATCHER_TRIGGER_FILENAME = "trigger.request"
+
+# Persistent record of trigger requests, written into the same host-visible directory —
+# `docker logs` output is easy to lose (container restart, log-driver rotation); this file isn't.
+_watcher_trigger_logger = None
+
+
+def _get_watcher_trigger_logger():
+    global _watcher_trigger_logger
+    if _watcher_trigger_logger is None and WATCHER_CONTROL_DIR:
+        os.makedirs(WATCHER_CONTROL_DIR, exist_ok=True)
+        log = logging.getLogger("watcher_trigger")
+        log.setLevel(logging.INFO)
+        log.propagate = False
+        handler = logging.handlers.RotatingFileHandler(
+            os.path.join(WATCHER_CONTROL_DIR, "trigger.log"), maxBytes=1 * 1024 * 1024, backupCount=2,
+            encoding="utf-8",
+        )
+        handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+        log.addHandler(handler)
+        _watcher_trigger_logger = log
+    return _watcher_trigger_logger
 
 # Set at startup once the registry is preloaded (see lifespan).
 _speaker_id_enabled = False
@@ -178,6 +206,49 @@ async def health():
         "jobs_total": len(jobs),
         "diarization_enabled": bool(HF_TOKEN) and ENABLE_DIARIZATION,
         "speaker_id_enabled": speaker_id_enabled,
+        "watcher_trigger_configured": bool(WATCHER_CONTROL_DIR),
+    }
+
+
+@app.post("/watcher/trigger")
+async def trigger_watcher(request: Request):
+    """Signal the host-side watcher (watcher.py) to run a sync pass now.
+
+    The container has no way to reach a process on the host directly (that's the whole reason
+    the watcher runs outside Docker — it needs the Google Drive mount), so this writes a signal
+    file into a directory shared with the host via a bind mount (WATCHER_CONTROL_DIR). The
+    watcher checks for it every `control_check_seconds` (default 5s) if it happens to be running.
+    This endpoint cannot confirm the watcher is actually running or that it picked up the signal.
+    """
+    if not WATCHER_CONTROL_DIR:
+        return JSONResponse(
+            status_code=503,
+            content={"detail": "WATCHER_CONTROL_DIR not configured on this server — watcher trigger unavailable."},
+        )
+
+    try:
+        os.makedirs(WATCHER_CONTROL_DIR, exist_ok=True)
+        trigger_path = os.path.join(WATCHER_CONTROL_DIR, WATCHER_TRIGGER_FILENAME)
+        tmp_path = trigger_path + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            f.write(str(time.time()))
+        os.replace(tmp_path, trigger_path)
+    except OSError as e:
+        return JSONResponse(status_code=500, content={"detail": f"Failed to write trigger signal: {e}"})
+
+    client_host = request.client.host if request.client else "unknown"
+    trigger_log = _get_watcher_trigger_logger()
+    if trigger_log:
+        trigger_log.info("Trigger requested from %s", client_host)
+    print(f"Watcher trigger requested from {client_host}")
+
+    return {
+        "status": "triggered",
+        "note": (
+            "Signal written. The host watcher picks it up within a few seconds if it is running — "
+            "this endpoint has no visibility into the host process, so it cannot confirm the scan "
+            "actually started. Check the host's watcher.log, or watch for new .txt files."
+        ),
     }
 
 
