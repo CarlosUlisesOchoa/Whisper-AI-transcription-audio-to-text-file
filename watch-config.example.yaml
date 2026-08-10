@@ -16,6 +16,10 @@ api:
   max_attempts: 5                # give up (mark failed, stop retrying) after this many failures
   backoff_base_seconds: 60       # first retry delay; doubles each attempt (exponential backoff)
   backoff_max_seconds: 3600      # cap on the backoff delay
+  explorer_refresh: true         # force a Windows shell (Explorer) enumeration of each root before walking it
+                                  # — Google Drive's virtual filesystem can leave a folder's listing stale
+                                  # until the shell touches it; requires pywin32 (see requirements-watcher.txt)
+  explorer_settle_seconds: 3     # only used by the visible-Explorer fallback, if the headless COM path fails
 
 watch:
   - path: "G:\\Mi unidad\\Documents GDrive\\Voice Memos Work\\test"
@@ -32,3 +36,4 @@ watch:
   #   align: true
   #   diarize: true
   #   enroll_unknown: false
+  #   explorer_refresh: false    # e.g. a purely local (non-Drive) root doesn't need the shell refresh

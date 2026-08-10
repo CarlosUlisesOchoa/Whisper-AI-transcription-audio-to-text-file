@@ -12,6 +12,11 @@ from dotenv import load_dotenv
 
 from naming import AUDIO_EXTENSIONS, sanitize_filename
 
+try:
+    import win32com.client  # pywin32 — Windows-only, optional
+except ImportError:  # not installed, or non-Windows host
+    win32com = None
+
 load_dotenv()
 
 APP_DIR = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "whisper-watcher")
@@ -38,12 +43,17 @@ DEFAULT_API = {
     "max_attempts": 5,
     "backoff_base_seconds": 60,
     "backoff_max_seconds": 3600,
+    "explorer_refresh": True,        # force a Windows shell enumeration of each root before walking it
+    "explorer_settle_seconds": 3,    # only used by the visible-Explorer fallback
 }
 
 logger = logging.getLogger("watcher")
 
 # path -> bool, tracks last-seen availability so we log only on state transitions
 _root_available = {}
+
+# Set True once we've warned about a missing/unusable shell-refresh path — don't repeat hourly.
+_refresh_warned = False
 
 
 def setup_logging():
@@ -140,6 +150,64 @@ def check_root_available(path):
     return available
 
 
+def _shell_enumerate(path, recursive):
+    """Walk `path` (and subfolders, if recursive) through the Shell.Application namespace,
+    materializing each folder's Items() — the same provider Explorer uses, which is what
+    wakes Google Drive's lazy directory listing. Raises on any COM failure; caller handles it.
+    """
+    shell = win32com.client.Dispatch("Shell.Application")
+    entry_count = 0
+
+    def enumerate_folder(folder_path):
+        nonlocal entry_count
+        folder = shell.NameSpace(folder_path)
+        if folder is None:
+            raise RuntimeError(f"Shell.NameSpace returned None for {folder_path}")
+        items = folder.Items()
+        subfolders = []
+        for item in items:
+            _ = item.Name  # force materialization of this entry
+            entry_count += 1
+            if recursive and item.IsFolder:
+                subfolders.append(item.Path)
+        for sub_path in subfolders:
+            enumerate_folder(sub_path)
+
+    enumerate_folder(path)
+    return entry_count
+
+
+def refresh_root(path, recursive, settle_seconds):
+    """Force the Windows shell to enumerate `path` before os.walk runs, so files added from
+    another device (which Drive's virtual filesystem may not surface to a plain Win32 walk
+    until the shell touches the folder) are discovered. Never raises — a refresh failure must
+    not abort a scan; the walk just proceeds against whatever listing is currently cached.
+    """
+    global _refresh_warned
+
+    if os.name != "nt" or win32com is None:
+        if not _refresh_warned:
+            logger.warning(
+                "Explorer refresh unavailable (non-Windows host or pywin32 not installed) — "
+                "walking roots without a shell refresh."
+            )
+            _refresh_warned = True
+        return
+
+    try:
+        entry_count = _shell_enumerate(path, recursive)
+        logger.info("Refreshed root via shell: %s (%d entries)", path, entry_count)
+        return
+    except Exception as e:
+        logger.warning("Shell.Application refresh failed for %s (%s) — falling back to Explorer window.", path, e)
+
+    try:
+        os.startfile(path)
+        time.sleep(settle_seconds)
+    except Exception as e:
+        logger.warning("Explorer fallback refresh failed for %s: %s", path, e)
+
+
 # --- Discovery ---
 
 def discover_candidates(root_cfg):
@@ -199,6 +267,9 @@ def process_root(root_cfg, api_cfg, state):
     path = root_cfg["path"]
     if not check_root_available(path):
         return []
+
+    if root_cfg.get("explorer_refresh", api_cfg["explorer_refresh"]):
+        refresh_root(path, root_cfg.get("recursive", True), api_cfg["explorer_settle_seconds"])
 
     now = time.time()
     stability_seconds = api_cfg["stability_seconds"]
@@ -430,6 +501,9 @@ def run_dry_run(watch_roots, api_cfg):
         if not os.path.isdir(path):
             logger.warning("[dry-run] Root unavailable, skipping: %s", path)
             continue
+
+        if root_cfg.get("explorer_refresh", api_cfg["explorer_refresh"]):
+            refresh_root(path, root_cfg.get("recursive", True), api_cfg["explorer_settle_seconds"])
 
         for file_path, txt_path, _size, _mtime in discover_candidates(root_cfg):
             entry = state.get(file_path, {})
