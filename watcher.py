@@ -3,6 +3,7 @@ import json
 import logging
 import logging.handlers
 import os
+import subprocess
 import sys
 import time
 
@@ -16,6 +17,11 @@ try:
     import win32com.client  # pywin32 — Windows-only, optional
 except ImportError:  # not installed, or non-Windows host
     win32com = None
+
+try:
+    import winreg  # stdlib, Windows-only
+except ImportError:  # non-Windows host
+    winreg = None
 
 load_dotenv()
 
@@ -45,6 +51,13 @@ DEFAULT_API = {
     "backoff_max_seconds": 3600,
     "explorer_refresh": True,        # force a Windows shell enumeration of each root before walking it
     "explorer_settle_seconds": 3,    # only used by the visible-Explorer fallback
+    "startup_delay_seconds": 30,     # grace period before the first readiness re-check
+    "root_wait_timeout_seconds": 300,  # stop waiting for roots and scan anyway after this
+    "root_wait_poll_seconds": 5,     # how often roots are re-checked while waiting
+    "unavailable_retry_seconds": 60,  # next-scan interval after a tick where any root was unavailable
+    "drive_autostart": True,         # launch Google Drive (launch.bat) if roots are missing at startup — Windows only
+    "drive_launcher": "",            # explicit path to launch.bat / GoogleDriveFS.exe; empty = auto-detect
+    "api_wait_timeout_seconds": 300,  # bounded wait on GET /health before the first tick, 0 disables
 }
 
 logger = logging.getLogger("watcher")
@@ -54,6 +67,12 @@ _root_available = {}
 
 # Set True once we've warned about a missing/unusable shell-refresh path — don't repeat hourly.
 _refresh_warned = False
+
+# Set True once we've warned that no Google Drive launcher could be resolved — one-shot, like above.
+_drive_launch_warned = False
+
+# Registry key for the Google Drive (File Stream) uninstall entry — version-agnostic.
+GOOGLE_DRIVE_UNINSTALL_KEY = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\{6BBAE539-2232-434A-A4E5-9A33560C6283}"
 
 
 def setup_logging():
@@ -208,6 +227,165 @@ def refresh_root(path, recursive, settle_seconds):
         logger.warning("Explorer fallback refresh failed for %s: %s", path, e)
 
 
+# --- Drive autostart (Windows-only, startup readiness gate) ---
+
+def _registry_drive_exe():
+    """Read the Google Drive uninstall registry key for GoogleDriveFS.exe's install path.
+    Returns the exe path, or None if the key is missing, unreadable, or doesn't point at it."""
+    if winreg is None:
+        return None
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, GOOGLE_DRIVE_UNINSTALL_KEY) as key:
+            install_location, _ = winreg.QueryValueEx(key, "InstallLocation")
+    except OSError:
+        return None
+    if install_location and os.path.basename(install_location).lower() == "googledrivefs.exe":
+        return install_location
+    return None
+
+
+def _launch_bat_candidates():
+    """launch.bat locations Google Drive is known to install to, in preference order."""
+    program_dirs = [
+        os.environ.get("ProgramW6432"),
+        os.environ.get("ProgramFiles"),
+        os.environ.get("ProgramFiles(x86)"),
+    ]
+    for program_dir in program_dirs:
+        if program_dir:
+            yield os.path.join(program_dir, "Google", "Drive File Stream", "launch.bat")
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    if local_app_data:
+        yield os.path.join(local_app_data, "Google", "DriveFS", "launch.bat")
+
+
+def resolve_drive_launcher(configured):
+    """Find a Google Drive launcher (exe or launch.bat) to invoke when roots are missing.
+    Never raises — any resolution failure just falls through to the next candidate."""
+    global _drive_launch_warned
+
+    try:
+        if configured and os.path.isfile(configured):
+            return configured
+
+        exe_path = _registry_drive_exe()
+        if exe_path and os.path.isfile(exe_path):
+            return exe_path
+
+        for candidate in _launch_bat_candidates():
+            if os.path.isfile(candidate):
+                return candidate
+    except Exception as e:
+        logger.warning("Error while resolving Google Drive launcher: %s", e)
+
+    if not _drive_launch_warned:
+        logger.warning(
+            "Could not resolve a Google Drive launcher (no configured path, registry entry, or "
+            "launch.bat found) — will only wait for roots, not attempt to start Drive."
+        )
+        _drive_launch_warned = True
+    return None
+
+
+def drive_is_running():
+    """Best-effort check for a running GoogleDriveFS.exe process. Any failure is treated as
+    'not running' so we don't skip a launch attempt just because tasklist misbehaved."""
+    try:
+        result = subprocess.run(
+            ["tasklist", "/FI", "IMAGENAME eq GoogleDriveFS.exe", "/NH"],
+            capture_output=True, text=True, timeout=10,
+        )
+        return "GoogleDriveFS.exe" in result.stdout
+    except Exception:
+        return False
+
+
+def launch_drive(launcher_path):
+    """Start Google Drive in the background. Never raises, never blocks — logs and returns."""
+    try:
+        if launcher_path.lower().endswith(".bat"):
+            cmd = ["cmd", "/c", launcher_path]
+        else:
+            cmd = [launcher_path]
+        # CREATE_NO_WINDOW | DETACHED_PROCESS — launch.bat's :FAIL branch calls `pause`, which
+        # under pythonw.exe (no console) would hang forever waiting for a keypress; stdin=DEVNULL
+        # makes it read EOF and exit instead.
+        subprocess.Popen(
+            cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            close_fds=True, creationflags=0x08000000 | 0x00000008,
+        )
+        logger.info("Launched Google Drive via: %s", launcher_path)
+        return True
+    except Exception as e:
+        logger.warning("Failed to launch Google Drive via %s: %s", launcher_path, e)
+        return False
+
+
+def wait_for_roots(watch_roots, api_cfg):
+    """Bounded wait, at startup, for all configured roots to appear as directories. Launches
+    Google Drive if configured and none of the roots are present yet. Returns True if every
+    root became available before the timeout, False if we gave up and are scanning anyway.
+    Zero cost (no delay, no log line) when every root is already present."""
+    missing = [r["path"] for r in watch_roots if not os.path.isdir(r["path"])]
+    if not missing:
+        return True
+
+    logger.warning("Waiting for %d root(s) to become available: %s", len(missing), missing)
+
+    if api_cfg["drive_autostart"] and os.name == "nt" and not drive_is_running():
+        launcher = resolve_drive_launcher(api_cfg["drive_launcher"])
+        if launcher:
+            launch_drive(launcher)
+
+    start = time.time()
+    deadline = start + api_cfg["root_wait_timeout_seconds"]
+    time.sleep(min(api_cfg["startup_delay_seconds"], max(deadline - time.time(), 0)))
+
+    while True:
+        still_missing = [r["path"] for r in watch_roots if not os.path.isdir(r["path"])]
+        if not still_missing:
+            logger.info("All roots available after %.0fs.", time.time() - start)
+            return True
+        if time.time() >= deadline:
+            logger.warning(
+                "Timed out after %.0fs waiting for: %s — scanning anyway.",
+                time.time() - start, still_missing,
+            )
+            return False
+        time.sleep(api_cfg["root_wait_poll_seconds"])
+
+
+def wait_for_api(api_cfg):
+    """Bounded wait, at startup, for GET /health to respond — avoids burning the submit-retry
+    backoff ladder while Docker/whisper-api is still starting on the same boot. No API key
+    needed (/health is exempt in security.py). timeout <= 0 disables the wait entirely."""
+    timeout = api_cfg.get("api_wait_timeout_seconds", 0)
+    if timeout <= 0:
+        return True
+
+    base_url = api_cfg["base_url"]
+    start = time.time()
+    deadline = start + timeout
+    while True:
+        try:
+            resp = requests.get(f"{base_url}/health", timeout=10)
+            if resp.status_code == 200:
+                elapsed = time.time() - start
+                if elapsed > 1:  # don't log on the common case where it was already up
+                    logger.info("whisper-api became reachable after %.0fs.", elapsed)
+                return True
+        except requests.RequestException:
+            pass
+
+        if time.time() >= deadline:
+            logger.warning(
+                "Timed out after %.0fs waiting for whisper-api at %s/health — proceeding anyway.",
+                time.time() - start, base_url,
+            )
+            return False
+        time.sleep(min(5, max(deadline - time.time(), 0)) or 0.1)
+
+
 # --- Discovery ---
 
 def discover_candidates(root_cfg):
@@ -263,10 +441,12 @@ def discover_candidates(root_cfg):
 
 
 def process_root(root_cfg, api_cfg, state):
-    """Update stability/backoff tracking for every candidate in this root; return file paths ready to submit."""
+    """Update stability/backoff tracking for every candidate in this root; return
+    (ready file paths, root was available). An unavailable root always returns ([], False),
+    distinguishable from "available, nothing new" ([], True)."""
     path = root_cfg["path"]
     if not check_root_available(path):
-        return []
+        return [], False
 
     if root_cfg.get("explorer_refresh", api_cfg["explorer_refresh"]):
         refresh_root(path, root_cfg.get("recursive", True), api_cfg["explorer_settle_seconds"])
@@ -308,7 +488,7 @@ def process_root(root_cfg, api_cfg, state):
 
     order = api_cfg.get("order", "newest_first")
     ready.sort(key=lambda fp: state[fp]["last_mtime"], reverse=(order == "newest_first"))
-    return ready[: api_cfg.get("max_files_per_cycle", 5)]
+    return ready[: api_cfg.get("max_files_per_cycle", 5)], True
 
 
 # --- Submission and job polling ---
@@ -455,6 +635,8 @@ def run_tick(watch_roots, api_cfg, state, source="scheduled"):
     """Run one full discovery+submit pass. `source` ("scheduled"/"manual"/"once") is only
     for the log lines below — it's what makes a directory scan visible in watcher.log even
     when nothing was found to submit, and distinguishes an automatic tick from a trigger.
+    Returns True if any root was unavailable during this tick (main() uses this to pick a
+    short retry interval instead of the full poll_interval_seconds).
     """
     logger.info("Scan starting (source=%s, roots=%d).", source, len(watch_roots))
 
@@ -464,8 +646,12 @@ def run_tick(watch_roots, api_cfg, state, source="scheduled"):
             poll_until_done(file_path, api_cfg, state)
 
     all_ready = []
+    any_unavailable = False
     for root_cfg in watch_roots:
-        for file_path in process_root(root_cfg, api_cfg, state):
+        ready, available = process_root(root_cfg, api_cfg, state)
+        if not available:
+            any_unavailable = True
+        for file_path in ready:
             all_ready.append((root_cfg, file_path))
     save_state(state)
 
@@ -484,13 +670,15 @@ def run_tick(watch_roots, api_cfg, state, source="scheduled"):
             poll_until_done(file_path, api_cfg, state)
 
     logger.info(
-        "Scan finished (source=%s): %d candidate(s) found, %d submitted.",
-        source, len(all_ready), submitted_count,
+        "Scan finished (source=%s): %d candidate(s) found, %d submitted, any_unavailable=%s.",
+        source, len(all_ready), submitted_count, any_unavailable,
     )
+    return any_unavailable
 
 
 def run_dry_run(watch_roots, api_cfg):
     """Preview what would be queued right now. Never submits, never writes state."""
+    wait_for_roots(watch_roots, api_cfg)
     state = load_state()
     max_attempts = api_cfg["max_attempts"]
     now = time.time()
@@ -576,6 +764,9 @@ def main():
     if not api_cfg["enabled"]:
         logger.info("Automatic scanning is disabled (api.enabled: false) — idling, waiting for manual triggers only.")
 
+    wait_for_roots(watch_roots, api_cfg)
+    wait_for_api(api_cfg)
+
     next_scan_at = 0.0  # due immediately on startup if enabled
 
     try:
@@ -589,8 +780,14 @@ def main():
                 # the rare tick where the hourly schedule also happened to be due at the same
                 # moment — the trigger is the more interesting fact for whoever reads the log.
                 source = "manual" if triggered else ("scheduled" if due else "once")
-                run_tick(watch_roots, api_cfg, state, source=source)
-                next_scan_at = time.time() + api_cfg["poll_interval_seconds"]
+                any_unavailable = run_tick(watch_roots, api_cfg, state, source=source)
+                if any_unavailable:
+                    interval = api_cfg["unavailable_retry_seconds"]
+                    logger.info("A root was unavailable this tick — rescheduling in %ds instead of %ds.",
+                                interval, api_cfg["poll_interval_seconds"])
+                else:
+                    interval = api_cfg["poll_interval_seconds"]
+                next_scan_at = time.time() + interval
 
             if args.once:
                 break
