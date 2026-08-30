@@ -1,4 +1,5 @@
 import argparse
+import collections
 import json
 import logging
 import logging.handlers
@@ -59,6 +60,20 @@ DEFAULT_API = {
     "drive_launcher": "",            # explicit path to launch.bat / GoogleDriveFS.exe; empty = auto-detect
     "api_wait_timeout_seconds": 300,  # bounded wait on GET /health before the first tick, 0 disables
 }
+
+# Small pad on top of a computed wake deadline so the tick lands just after the deadline
+# (stability window / backoff retry), not exactly on it — avoids waking one loop iteration
+# too early and re-holding the same file for another full cycle.
+WAKE_MARGIN_SECONDS = 3
+
+# process_root's per-root result: `next_deadline` (absolute timestamp, or None) is the
+# earliest moment this root has work currently blocked by the stability window or backoff
+# retry; `deadline_reason` ("stability" / "retry" / "backlog") explains it for logging.
+# `discovered`/`held` are raw counts so a tick that finds work but can't submit it yet
+# doesn't look identical to an empty folder in watcher.log.
+RootResult = collections.namedtuple(
+    "RootResult", "ready available next_deadline deadline_reason discovered held"
+)
 
 logger = logging.getLogger("watcher")
 
@@ -207,8 +222,9 @@ def refresh_root(path, recursive, settle_seconds):
     if os.name != "nt" or win32com is None:
         if not _refresh_warned:
             logger.warning(
-                "Explorer refresh unavailable (non-Windows host or pywin32 not installed) — "
-                "walking roots without a shell refresh."
+                "Explorer refresh unavailable (non-Windows host, or pywin32 not installed in "
+                "this interpreter: %s) — walking roots without a shell refresh.",
+                sys.executable,
             )
             _refresh_warned = True
         return
@@ -441,12 +457,13 @@ def discover_candidates(root_cfg):
 
 
 def process_root(root_cfg, api_cfg, state):
-    """Update stability/backoff tracking for every candidate in this root; return
-    (ready file paths, root was available). An unavailable root always returns ([], False),
-    distinguishable from "available, nothing new" ([], True)."""
+    """Update stability/backoff tracking for every candidate in this root; return a
+    RootResult (see its docstring above). An unavailable root always returns
+    ready=[] available=False, distinguishable from "available, nothing new"
+    (ready=[] available=True)."""
     path = root_cfg["path"]
     if not check_root_available(path):
-        return [], False
+        return RootResult([], False, None, None, 0, 0)
 
     if root_cfg.get("explorer_refresh", api_cfg["explorer_refresh"]):
         refresh_root(path, root_cfg.get("recursive", True), api_cfg["explorer_settle_seconds"])
@@ -455,8 +472,20 @@ def process_root(root_cfg, api_cfg, state):
     stability_seconds = api_cfg["stability_seconds"]
     max_attempts = api_cfg["max_attempts"]
 
-    ready = []
+    discovered = 0
+    held = 0
+    next_deadline = None
+    deadline_reason = None
+
+    def note_deadline(deadline, reason):
+        nonlocal next_deadline, deadline_reason
+        if next_deadline is None or deadline < next_deadline:
+            next_deadline = deadline
+            deadline_reason = reason
+
+    ready_all = []
     for file_path, txt_path, size, mtime in discover_candidates(root_cfg):
+        discovered += 1
         entry = state.get(file_path, {})
 
         if entry.get("status") == "submitted" and entry.get("job_id"):
@@ -465,6 +494,8 @@ def process_root(root_cfg, api_cfg, state):
             continue
         next_retry_at = entry.get("next_retry_at")
         if next_retry_at and now < next_retry_at:
+            held += 1
+            note_deadline(next_retry_at, "retry")
             continue
 
         if entry.get("last_size") == size and entry.get("last_mtime") == mtime:
@@ -484,11 +515,23 @@ def process_root(root_cfg, api_cfg, state):
         state[file_path] = entry
 
         if now - stable_since >= stability_seconds:
-            ready.append(file_path)
+            ready_all.append(file_path)
+        else:
+            held += 1
+            note_deadline(stable_since + stability_seconds, "stability")
 
     order = api_cfg.get("order", "newest_first")
-    ready.sort(key=lambda fp: state[fp]["last_mtime"], reverse=(order == "newest_first"))
-    return ready[: api_cfg.get("max_files_per_cycle", 5)], True
+    ready_all.sort(key=lambda fp: state[fp]["last_mtime"], reverse=(order == "newest_first"))
+    max_files = api_cfg.get("max_files_per_cycle", 5)
+    ready = ready_all[:max_files]
+
+    if len(ready_all) > max_files:
+        # Backlog exceeds this cycle's cap — these are already stable, just not selected this
+        # tick. Note a due-now deadline so the next tick fires quickly and drains them, instead
+        # of waiting a full poll_interval_seconds.
+        note_deadline(now, "backlog")
+
+    return RootResult(ready, True, next_deadline, deadline_reason, discovered, held)
 
 
 # --- Submission and job polling ---
@@ -635,26 +678,56 @@ def run_tick(watch_roots, api_cfg, state, source="scheduled"):
     """Run one full discovery+submit pass. `source` ("scheduled"/"manual"/"once") is only
     for the log lines below — it's what makes a directory scan visible in watcher.log even
     when nothing was found to submit, and distinguishes an automatic tick from a trigger.
-    Returns True if any root was unavailable during this tick (main() uses this to pick a
-    short retry interval instead of the full poll_interval_seconds).
+    Returns (any_unavailable, next_deadline, deadline_reason): whether any root was
+    unavailable this tick, and the earliest absolute timestamp (plus why: "stability" /
+    "retry" / "backlog") at which blocked work across all roots becomes actionable — main()
+    uses these, together with any_unavailable, to pick the next wake time instead of always
+    waiting the full poll_interval_seconds.
     """
     logger.info("Scan starting (source=%s, roots=%d).", source, len(watch_roots))
+
+    next_deadline = None
+    deadline_reason = None
+
+    def note_deadline(deadline, reason):
+        nonlocal next_deadline, deadline_reason
+        if deadline is not None and (next_deadline is None or deadline < next_deadline):
+            next_deadline = deadline
+            deadline_reason = reason
+
+    def note_retry_if_scheduled(file_path):
+        # A submit/poll failure just now (this tick, not a stale state entry) may have
+        # scheduled a fresh backoff via schedule_retry — fold it into this tick's own wake
+        # computation. Without this, a failure discovered mid-tick wouldn't be reflected
+        # until process_root re-reads state on some future tick, and a submit failure would
+        # silently reschedule at the full poll_interval_seconds instead of backoff_base_seconds
+        # — the exact "backoff ladder collapses to hourly" bug this fix exists to close.
+        entry = state.get(file_path)
+        if entry:
+            note_deadline(entry.get("next_retry_at"), "retry")
 
     # Resume anything left in-flight from a previous run before looking for new work.
     for file_path, entry in list(state.items()):
         if entry.get("status") == "submitted" and entry.get("job_id"):
             poll_until_done(file_path, api_cfg, state)
+            note_retry_if_scheduled(file_path)
 
     all_ready = []
     any_unavailable = False
+    discovered_total = 0
+    held_total = 0
     for root_cfg in watch_roots:
-        ready, available = process_root(root_cfg, api_cfg, state)
-        if not available:
+        result = process_root(root_cfg, api_cfg, state)
+        discovered_total += result.discovered
+        held_total += result.held
+        if not result.available:
             any_unavailable = True
-        for file_path in ready:
+        note_deadline(result.next_deadline, result.deadline_reason)
+        for file_path in result.ready:
             all_ready.append((root_cfg, file_path))
     save_state(state)
 
+    ready_total = len(all_ready)
     submitted_count = 0
     max_inflight = api_cfg["max_inflight"]
     for root_cfg, file_path in all_ready:
@@ -668,12 +741,14 @@ def run_tick(watch_roots, api_cfg, state, source="scheduled"):
         if submit_and_track(file_path, root_cfg, api_cfg, state):
             submitted_count += 1
             poll_until_done(file_path, api_cfg, state)
+        note_retry_if_scheduled(file_path)
 
     logger.info(
-        "Scan finished (source=%s): %d candidate(s) found, %d submitted, any_unavailable=%s.",
-        source, len(all_ready), submitted_count, any_unavailable,
+        "Scan finished (source=%s): %d discovered, %d ready, %d submitted, %d held "
+        "(stability/backoff), any_unavailable=%s.",
+        source, discovered_total, ready_total, submitted_count, held_total, any_unavailable,
     )
-    return any_unavailable
+    return any_unavailable, next_deadline, deadline_reason
 
 
 def run_dry_run(watch_roots, api_cfg):
@@ -780,14 +855,24 @@ def main():
                 # the rare tick where the hourly schedule also happened to be due at the same
                 # moment — the trigger is the more interesting fact for whoever reads the log.
                 source = "manual" if triggered else ("scheduled" if due else "once")
-                any_unavailable = run_tick(watch_roots, api_cfg, state, source=source)
-                if any_unavailable:
-                    interval = api_cfg["unavailable_retry_seconds"]
-                    logger.info("A root was unavailable this tick — rescheduling in %ds instead of %ds.",
-                                interval, api_cfg["poll_interval_seconds"])
-                else:
-                    interval = api_cfg["poll_interval_seconds"]
+                any_unavailable, next_deadline, deadline_reason = run_tick(
+                    watch_roots, api_cfg, state, source=source
+                )
+
+                # Wake at the earliest real deadline (stability window, backoff retry, or a
+                # root-unavailable short retry), capped by poll_interval_seconds, floored by
+                # control_check_seconds so a stale/past deadline can never spin the loop.
+                interval, reason = api_cfg["poll_interval_seconds"], "poll_interval"
+                if any_unavailable and api_cfg["unavailable_retry_seconds"] < interval:
+                    interval, reason = api_cfg["unavailable_retry_seconds"], "unavailable"
+                if next_deadline is not None:
+                    deadline_interval = max(next_deadline - time.time(), 0) + WAKE_MARGIN_SECONDS
+                    if deadline_interval < interval:
+                        interval, reason = deadline_interval, deadline_reason
+                interval = max(interval, api_cfg["control_check_seconds"])
+
                 next_scan_at = time.time() + interval
+                logger.info("Next scan in %ds (reason=%s).", interval, reason)
 
             if args.once:
                 break

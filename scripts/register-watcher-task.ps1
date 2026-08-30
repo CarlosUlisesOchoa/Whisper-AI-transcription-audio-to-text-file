@@ -14,6 +14,18 @@ if (-not (Test-Path $VenvPythonw)) {
     exit 1
 }
 
+# pywin32 must be installed INTO THIS VENV, not user-site — the scheduled task launches
+# pythonw.exe from here directly, so a user-site install (pip install --user) is invisible
+# to it. Without it, watcher.py's Explorer/COM staleness refresh silently degrades to a
+# plain os.walk on every run (see dev-docs/watcher-deadline-aware-rescan.md). Fail loud here
+# instead of registering a half-broken task.
+$VenvPython = Join-Path (Split-Path -Parent $VenvPythonw) "python.exe"
+& $VenvPython -c "import win32com.client" 2>$null
+if ($LASTEXITCODE -ne 0) {
+    Write-Error "pywin32 is not installed in the venv at '$VenvPython'. Install it with:`n    $VenvPython -m pip install pywin32"
+    exit 1
+}
+
 $watcherScript = Join-Path $RepoRoot "watcher.py"
 if (-not (Test-Path $watcherScript)) {
     Write-Error "watcher.py not found at '$watcherScript'."
